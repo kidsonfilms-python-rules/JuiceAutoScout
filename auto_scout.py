@@ -138,6 +138,8 @@ class RobotTracker:
     N_BG_SAMPLES  = 80    # frames sampled to build the median background
     FG_THRESH     = 25    # grayscale diff threshold (0-255)
     BLOB_MIN      = 300   # minimum blob area in image pixels²
+    MIN_RADIUS_PX = 10    # minimum inscribed-circle radius to be a robot
+                          # balls ≤8 px, robots ≥11 px — clean gap
     KERNEL_PX     = 9     # morphology kernel size
     MAX_COAST     = 60    # frames a track can coast without a detection
     MAX_DIST_IN   = 60.0  # max field-inch jump for blob→track assignment
@@ -167,15 +169,28 @@ class RobotTracker:
         cv2, np = self.cv2, self.np
         h, w = frame_shape[:2]
 
-        # Field-polygon mask in image space — slightly inset from the corners
-        # to avoid alliance-station wall bleed on the left/right edges.
+        # Field-polygon mask in image space.
+        # Robots at the field edges hang slightly outside the calibrated
+        # corner polygon (especially at the bottom where the camera angle
+        # is steep). We expand the polygon outward per-edge so the full
+        # robot blob is captured, while keeping the top edge tight to
+        # avoid picking up the alliance-station backdrops above the field.
         tl, tr, br, bl = ordered_corners
-        poly = np.array([
-            [int(tl[0]+15), int(tl[1]+5)],
-            [int(tr[0]-15), int(tr[1]+5)],
-            [int(br[0]-15), int(br[1]-5)],
-            [int(bl[0]+15), int(bl[1]-5)],
-        ], dtype=np.int32)
+        cx_poly = (tl[0]+tr[0]+br[0]+bl[0]) / 4
+        cy_poly = (tl[1]+tr[1]+br[1]+bl[1]) / 4
+
+        SIDE_PAD   = 25   # px — left / right expansion
+        BOTTOM_PAD = 25   # px — bottom expansion (robots overhang here most)
+        TOP_PAD    =  5   # px — top kept tight to avoid alliance backdrops
+
+        def _pad(x, y):
+            dx = x - cx_poly; dy = y - cy_poly
+            px = SIDE_PAD   if dx > 0 else -SIDE_PAD
+            py = BOTTOM_PAD if dy > 0 else -TOP_PAD
+            return int(x + px), int(y + py)
+
+        poly = np.array([_pad(*tl), _pad(*tr), _pad(*br), _pad(*bl)],
+                        dtype=np.int32)
         self._field_mask = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(self._field_mask, [poly], 255)
 
@@ -271,10 +286,12 @@ class RobotTracker:
 
     def _foreground_contours(self, frame):
         """
-        Return (all_contours, top4_contours) from the foreground mask.
-        Used by the debug overlay to draw every detected blob.
-        all_contours: every contour above BLOB_MIN, sorted area desc.
-        top4_contours: the same contours that _get_blobs() would pick.
+        Return (all_contours, split_centers) from the foreground mask.
+        all_contours : every contour above BLOB_MIN, sorted area desc.
+                       Used to draw white/yellow outlines.
+        split_centers: list of (cx_px, cy_px) — the actual sub-centers
+                       produced by _split_contour(), i.e. what _get_blobs
+                       would use.  Drawn as small crosses in the overlay.
         """
         cv2, np = self.cv2, self.np
         diff = cv2.absdiff(frame, self._bg)
@@ -287,12 +304,71 @@ class RobotTracker:
         valid = sorted(
             [c for c in cnts if cv2.contourArea(c) >= self.BLOB_MIN],
             key=lambda c: -cv2.contourArea(c))
-        return valid, valid[:4]
+        # Collect split centers for all valid contours
+        all_split = []
+        for c in valid:
+            area = float(cv2.contourArea(c))
+            subs = self._split_contour(c)
+            per = area / max(len(subs), 1)
+            for (sx, sy) in subs:
+                all_split.append((sx, sy, per))
+        all_split.sort(key=lambda x: -x[2])
+        split_centers = [(int(sx), int(sy)) for sx, sy, _ in all_split]
+        return valid, split_centers
+
+    def _split_contour(self, contour):
+        """
+        Use the distance transform to find individual robot centers within a
+        contour that may contain multiple touching/merged robots.
+
+        Returns a list of (cx_px, cy_px) image-pixel centers — one per
+        local maximum found in the distance transform of the filled contour.
+        A single isolated robot produces exactly one peak; two touching robots
+        produce two peaks; etc.
+        """
+        cv2, np = self.cv2, self.np
+        h, w = self._field_mask.shape[:2]
+
+        # Rasterise just this contour into its own mask
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(mask, [contour], -1, 255, -1)
+
+        # Distance transform: each pixel's value = distance to nearest edge
+        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        if dist.max() == 0:
+            return []
+
+        # Threshold at 40 % of the max distance to find "peak" regions.
+        # A single compact robot gives one peak region; two touching robots
+        # give two separate peak regions because there is a saddle point
+        # between them where the distance drops below 40 %.
+        _, peak_mask = cv2.threshold(
+            dist, dist.max() * 0.40, 255, cv2.THRESH_BINARY)
+        peak_mask = peak_mask.astype(np.uint8)
+
+        # Erode to pull apart adjacent peak regions that still touch
+        k_sep = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        peak_mask = cv2.erode(peak_mask, k_sep)
+
+        # Each connected component of the peak mask = one robot center
+        n_labels, labels = cv2.connectedComponents(peak_mask)
+        centers = []
+        for lbl in range(1, n_labels):
+            comp = (labels == lbl).astype(np.uint8)
+            M = cv2.moments(comp)
+            if M["m00"] > 0:
+                centers.append((M["m10"] / M["m00"],
+                                 M["m01"] / M["m00"]))
+        return centers
 
     def _get_blobs(self, frame):
         """
-        Return up to 4 (fx_in, fy_in, heading_rad) tuples, sorted largest first.
-        Works in original image space — no BEV needed.
+        Return up to 4 (fx_in, fy_in, heading_rad) tuples, sorted by
+        blob area descending.
+
+        Each foreground contour is passed through _split_contour() so that
+        merged / touching robots produce multiple centers rather than one
+        centroid halfway between them.
         """
         cv2, np = self.cv2, self.np
 
@@ -304,28 +380,34 @@ class RobotTracker:
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  self._kern)
 
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        blobs = []
+
+        # Collect all candidate centers with their parent-blob area
+        candidates = []
         for c in cnts:
             area = float(cv2.contourArea(c))
             if area < self.BLOB_MIN:
                 continue
-            M = cv2.moments(c)
-            if M["m00"] == 0:
+            # Reject game balls: compute inscribed-circle radius via
+            # distance transform. Balls ≤8 px radius; robots ≥11 px.
+            _bm = np.zeros(self._field_mask.shape, dtype=np.uint8)
+            cv2.drawContours(_bm, [c], -1, 255, -1)
+            _dr = cv2.distanceTransform(_bm, cv2.DIST_L2, 5)
+            if _dr.max() < self.MIN_RADIUS_PX:
                 continue
-            cx = M["m10"] / M["m00"]
-            cy = M["m01"] / M["m00"]
-            # Project image centroid → field inches
-            pt = np.array([[[cx, cy]]], dtype=np.float32)
-            fp = cv2.perspectiveTransform(pt, self._H_2d)[0][0]
-            fx, fy = float(fp[0]), float(fp[1])
-            # Discard points outside the 144×144 in field bounds
-            if not (0 <= fx <= 144 and 0 <= fy <= 144):
-                continue
-            heading = math.radians(cv2.fitEllipse(c)[2]) if len(c) >= 5 else 0.0
-            blobs.append((fx, fy, heading, area))
+            sub_centers = self._split_contour(c)
+            # Divide area equally among sub-centers for ranking purposes
+            per_center_area = area / max(len(sub_centers), 1)
+            for (cx, cy) in sub_centers:
+                pt = np.array([[[cx, cy]]], dtype=np.float32)
+                fp = cv2.perspectiveTransform(pt, self._H_2d)[0][0]
+                fx, fy = float(fp[0]), float(fp[1])
+                if not (0 <= fx <= 144 and 0 <= fy <= 144):
+                    continue
+                heading = 0.0  # heading from split center is unreliable
+                candidates.append((fx, fy, heading, per_center_area))
 
-        blobs.sort(key=lambda b: -b[3])
-        return [(fx, fy, h) for fx, fy, h, _ in blobs[:4]]
+        candidates.sort(key=lambda b: -b[3])
+        return [(fx, fy, h) for fx, fy, h, _ in candidates[:4]]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,6 +453,7 @@ def process_match(
     start_offset_sec  = 0.0,
     sample_rate_fps   = 10.0,
     debug             = False,
+    debug_every_n     = 10,
     manual_corners_px = None,
 ):
     cv2 = _require("cv2", "opencv-python")
@@ -391,6 +474,9 @@ def process_match(
     frame_step  = max(1, int(round(video_fps / sample_rate_fps)))
     print("[INFO] Processing every {} frames (~{:.1f} fps output)".format(
         frame_step, video_fps / frame_step))
+    if debug:
+        print("[INFO] Saving debug frame every {} processed frames".format(
+            debug_every_n))
 
     # ── output files ─────────────────────────────────────────────────────
     csv_path    = os.path.join(output_dir, "robot_positions.csv")
@@ -500,26 +586,33 @@ def process_match(
                               [ordered.astype(np.int32).reshape(-1,1,2)],
                               True, (0, 200, 0), 2)
 
-            # Draw all foreground blobs (white outline = ignored, yellow = top-4)
+            # Draw all foreground blobs and their split centers.
+            # Yellow outline = robot-sized (passes radius filter)
+            # Gray  outline = too small (ball or noise, filtered out)
+            # Cyan cross    = split center fed to the tracker
             if tracker._bg is not None:
-                all_cnts, top4_cnts = tracker._foreground_contours(frame)
-                top4_set = set(id(c) for c in top4_cnts)
+                all_cnts, split_centers = tracker._foreground_contours(frame)
                 for c in all_cnts:
                     area = cv2.contourArea(c)
-                    is_top4 = id(c) in top4_set
-                    color = (0, 255, 255) if is_top4 else (180, 180, 180)
-                    thickness = 2 if is_top4 else 1
-                    cv2.drawContours(dbg, [c], -1, color, thickness)
-                    # Label area on larger blobs
-                    if area >= tracker.BLOB_MIN * 2:
-                        M = cv2.moments(c)
-                        if M["m00"] > 0:
-                            bx = int(M["m10"] / M["m00"])
-                            by = int(M["m01"] / M["m00"])
+                    _bm2 = np.zeros(tracker._field_mask.shape, np.uint8)
+                    cv2.drawContours(_bm2, [c], -1, 255, -1)
+                    _dr2 = cv2.distanceTransform(_bm2, cv2.DIST_L2, 5)
+                    is_robot = _dr2.max() >= tracker.MIN_RADIUS_PX
+                    color = (0, 255, 255) if is_robot else (160, 160, 160)
+                    cv2.drawContours(dbg, [c], -1, color, 2 if is_robot else 1)
+                    if area >= tracker.BLOB_MIN:
+                        M2 = cv2.moments(c)
+                        if M2["m00"] > 0:
+                            bx2 = int(M2["m10"] / M2["m00"])
+                            by2 = int(M2["m01"] / M2["m00"])
                             cv2.putText(dbg, "{:.0f}".format(area),
-                                        (bx - 15, by + 4),
+                                        (bx2 - 15, by2 + 4),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.35,
                                         color, 1)
+                # Cyan crosses = split centers used by tracker
+                for sx, sy in split_centers[:4]:
+                    cv2.drawMarker(dbg, (sx, sy), (0, 255, 255),
+                                   cv2.MARKER_CROSS, 16, 2)
 
             n_drawn = 0
             fh, fw = frame.shape[:2]
@@ -544,7 +637,7 @@ def process_match(
             lbl = "init" if not tracker._initialized else "{}/4".format(n_drawn)
             cv2.putText(dbg, "t={:.2f}s  [{}]".format(match_time_s, lbl),
                         (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-            if processed % 5 == 0:
+            if processed % debug_every_n == 0:
                 cv2.imwrite(os.path.join(debug_dir,
                             "frame_{:06d}.jpg".format(processed)), dbg)
 
@@ -605,6 +698,8 @@ def main():
                    help="Frames per second to process (default 10)")
     p.add_argument("--debug",        action="store_true",
                    help="Save annotated debug frames to tracker_debug/")
+    p.add_argument("--debug-every",  type=int, default=5,
+                   help="Save 1 debug frame every N processed frames (default 5)")
     p.add_argument("--no-download",  action="store_true")
     p.add_argument("--video-path",   default=None)
     p.add_argument("--corners",      default=None,
@@ -634,6 +729,7 @@ def main():
         start_offset_sec  = args.start_offset,
         sample_rate_fps   = args.sample_rate,
         debug             = args.debug,
+        debug_every_n     = args.debug_every,
         manual_corners_px = corners,
     )
 

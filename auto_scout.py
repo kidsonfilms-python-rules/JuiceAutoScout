@@ -1,30 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-auto_scout.py — FTC DECODE robot tracker.
+auto_scout.py — FTC DECODE robot tracker  (v3.1)
 
-Pipeline:
-  1. Build a per-pixel MEDIAN background image from 80 frames sampled evenly
-     across the full match.  Because robots move around, each floor pixel has
-     the floor colour in >50% of frames → the median is a clean empty-field
-     image with no ghost robots.
+Base: v3 topology-based merge tracking (the "better but still buggy" version).
+Changes in v3.1 — targeted fixes only, zero structural changes:
 
-  2. Each frame: diff against the median background, threshold, find contours
-     inside the field polygon, take the 4 LARGEST blobs.  Robots are always
-     the biggest non-floor objects.  No BEV needed — works in the original
-     camera image, so perspective distortion doesn't corrupt dark robots.
+  a) NECK-BREAKING  — after the standard morphology pass, erode the fg mask by
+     a physics-derived kernel (~15 % of robot pixel width) then dilate back.
+     Severs thin noise bridges between two nearby robots before contour-finding,
+     preventing spurious merges entirely.  Kernel size is computed from the
+     homography + known 18" robot footprint, so it auto-scales to any camera.
 
-  3. Convert blob centroids to field coordinates via the homography from the
-     calibrated field corners.
+  b) UNCAPPED CANDIDATE POOL  — _get_blobs now returns every valid sub-centre,
+     not capped at 4.  Previously a merged blob produced 2 split-centres and
+     consumed 2 of the 4 slots, starving the other 2 solo robots.
 
-  4. Greedy nearest-neighbour assignment to 4 persistent tracks (no velocity
-     prediction — avoids drift when blobs temporarily merge).  Tracks coast
-     for up to MAX_COAST frames when no blob is assigned.
+  c) GLOBAL OPTIMAL ASSIGNMENT  — replaced the greedy nearest-neighbour loop
+     with scipy.optimize.linear_sum_assignment (Hungarian algorithm).  Greedy
+     processed tracks 0→3 in order, so track 0 always grabbed the nearest blob
+     first; downstream tracks got leftovers.  A greedy fallback is used when
+     scipy is not installed.
+
+  d) SOFT DISTANCE COST  — distance is now a continuous cost (d / MAX_DIST_IN),
+     not a hard gate.  Robots that sprint beyond 30" between sampled frames are
+     no longer dropped.
 
 Usage:
   python3 auto_scout.py --no-download --video-path match.mp4 \\
       --corners field_corners.json [--debug] [--start-offset 1.0]
 
-field_corners.json is produced by ftc_calibrate.py.
+Dependencies:
+  pip install opencv-python numpy progress
+  pip install scipy          # optional — enables optimal assignment
 """
 
 import argparse
@@ -34,7 +41,9 @@ import math
 import os
 import struct
 import sys
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field as dc_field
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 
 def _require(package, pip_name=None):
@@ -47,8 +56,30 @@ def _require(package, pip_name=None):
         sys.exit(1)
 
 
+def _make_bar(label, max_val):
+    try:
+        from progress.bar import Bar
+        return Bar(label, max=max_val,
+                   suffix="%(percent).0f%% %(elapsed_td)s ETA %(eta_td)s")
+    except ImportError:
+        class _FallbackBar:
+            def __init__(self, lbl, total):
+                self._lbl   = lbl
+                self._total = max(total, 1)
+                self._n     = 0
+                print("[{}] 0%".format(lbl), end="", flush=True)
+            def next(self):
+                self._n += 1
+                pct = int(self._n / self._total * 100)
+                if self._n % max(1, self._total // 20) == 0 or self._n == self._total:
+                    print("\r[{}] {}%".format(self._lbl, pct), end="", flush=True)
+            def finish(self):
+                print()
+        return _FallbackBar(label, max_val)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# WPILOG writer  (double[] — no struct schema needed)
+# WPILOG writer
 # ─────────────────────────────────────────────────────────────────────────────
 class WPILogWriter:
     HEADER_MAGIC = b"WPILOG"
@@ -117,109 +148,138 @@ class RobotPose:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MergeGroup
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class MergeGroup:
+    """
+    State for 2 (or more) tracks sharing a single foreground blob.
+
+    track_ids   : tracks sorted by projection onto entry_axis at merge time.
+                  Index 0 = most "negative" end of axis.
+    entry_axis  : unit vector (ax, ay) in IMAGE pixel space pointing from
+                  track_ids[0] toward track_ids[-1] at merge time.
+    parent_id   : contour parent_id of the current merged blob.
+    crossed     : True if dist-transform peaks have swapped sides relative to
+                  entry ordering.  Updated every frame during the merge.
+    """
+    track_ids  : List[int]             = dc_field(default_factory=list)
+    entry_axis : Tuple[float, float]   = (1.0, 0.0)
+    parent_id  : int                   = -1
+    crossed    : bool                  = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RobotTracker
 # ─────────────────────────────────────────────────────────────────────────────
 class RobotTracker:
     """
-    Detect robots by diffing each frame against a per-pixel median background,
-    then assign the 4 largest foreground blobs to 4 persistent tracks using
-    greedy nearest-neighbour.
+    Detect and track 4 robots using median background subtraction plus
+    topology-aware merge handling.
 
-    Key design decisions:
-    - Per-pixel median of 80 evenly-sampled frames → clean empty-field BG.
-      Robots move enough that the floor shows through at every pixel.
-    - Work in ORIGINAL image space (not BEV) so perspective distortion doesn't
-      make dark robots invisible.
-    - NO velocity prediction in the tracker — pure last-known-position memory.
-      Avoids compounding drift when two robots temporarily merge into one blob.
-    - Tracks coast for MAX_COAST frames so robots that stop briefly stay visible.
+    Normal frames  : globally optimal assignment of blobs to tracks.
+    Merged frames  : dist-transform peaks watched inside the merged blob;
+                     crossing detected by monitoring which side of the entry
+                     axis each peak is on.
+    Separation     : if crossed → swap IDs; else → preserve IDs.
     """
 
-    N_BG_SAMPLES  = 80    # frames sampled to build the median background
-    FG_THRESH     = 25    # grayscale diff threshold (0-255)
-    BLOB_MIN      = 300   # minimum blob area in image pixels²
-    MIN_RADIUS_PX = 10    # minimum inscribed-circle radius to be a robot
-                          # balls ≤8 px, robots ≥11 px — clean gap
-    KERNEL_PX     = 9     # morphology kernel size
-    MAX_COAST     = 60    # frames a track can coast without a detection
-    MAX_DIST_IN   = 60.0  # max field-inch jump for blob→track assignment
+    N_BG_SAMPLES  = 80
+    FG_THRESH     = 25
+    BLOB_MIN      = 300
+    MIN_RADIUS_PX = 10
+    KERNEL_PX     = 9
+    MAX_COAST     = 60
+    MAX_DIST_IN   = 30.0   # scale for soft distance cost
+    ROBOT_SIZE_IN = 18.0   # FTC max robot footprint (inches)
 
     def __init__(self, cv2, np):
         self.cv2, self.np = cv2, np
-        self._bg          = None   # uint8 BGR background image (original space)
-        self._field_mask  = None   # uint8 mask in original image space
-        self._H_2d        = None   # image px → field inches
-        self._kern        = cv2.getStructuringElement(
-                                cv2.MORPH_ELLIPSE, (self.KERNEL_PX, self.KERNEL_PX))
+        self._bg           = None
+        self._field_mask   = None
+        self._H_2d         = None
+        self._H_inv        = None
+        self._kern         = cv2.getStructuringElement(
+                                 cv2.MORPH_ELLIPSE, (self.KERNEL_PX, self.KERNEL_PX))
+        self._neck_kern    = None   # set in setup()
+        self._robot_max_px = 60     # safe default; overwritten in setup()
 
         self.tracked_poses = [RobotPose() for _ in range(4)]
-        self._pos    = [None] * 4   # last known (fx_in, fy_in) per robot
-        self._coast  = [999]  * 4   # 999 = never seen
-        self._initialized = False
+        self._pos          = [None] * 4   # (x_in, y_in) field coords
+        self._pos_px       = [None] * 4   # (cx_px, cy_px) image coords
+        self._coast        = [999]  * 4
+        self._initialized  = False
 
-    # ── public API ──────────────────────────────────────────────────────────
+        self._merge_groups: Dict[FrozenSet, MergeGroup] = {}
+
+    # ── setup ────────────────────────────────────────────────────────────
 
     def setup(self, video_path, ordered_corners, frame_shape):
-        """
-        Build the field mask, homography, and median background.
-
-        ordered_corners : float32 [TL, TR, BR, BL] in image pixels
-        frame_shape     : (h, w, c) of a typical frame
-        """
         cv2, np = self.cv2, self.np
         h, w = frame_shape[:2]
 
-        # Field-polygon mask in image space.
-        # Robots at the field edges hang slightly outside the calibrated
-        # corner polygon (especially at the bottom where the camera angle
-        # is steep). We expand the polygon outward per-edge so the full
-        # robot blob is captured, while keeping the top edge tight to
-        # avoid picking up the alliance-station backdrops above the field.
         tl, tr, br, bl = ordered_corners
         cx_poly = (tl[0]+tr[0]+br[0]+bl[0]) / 4
         cy_poly = (tl[1]+tr[1]+br[1]+bl[1]) / 4
-
-        SIDE_PAD   = 25   # px — left / right expansion
-        BOTTOM_PAD = 25   # px — bottom expansion (robots overhang here most)
-        TOP_PAD    =  5   # px — top kept tight to avoid alliance backdrops
+        SIDE_PAD = 25; BOTTOM_PAD = 25; TOP_PAD = 5
 
         def _pad(x, y):
             dx = x - cx_poly; dy = y - cy_poly
-            px = SIDE_PAD   if dx > 0 else -SIDE_PAD
-            py = BOTTOM_PAD if dy > 0 else -TOP_PAD
-            return int(x + px), int(y + py)
+            return (int(x + (SIDE_PAD   if dx > 0 else -SIDE_PAD)),
+                    int(y + (BOTTOM_PAD if dy > 0 else -TOP_PAD)))
 
-        poly = np.array([_pad(*tl), _pad(*tr), _pad(*br), _pad(*bl)],
-                        dtype=np.int32)
+        poly = np.array([_pad(*tl), _pad(*tr), _pad(*br), _pad(*bl)], dtype=np.int32)
         self._field_mask = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(self._field_mask, [poly], 255)
 
-        # Homography: image pixels → field inches
         dst2d = np.array([[0,144],[144,144],[144,0],[0,0]], dtype=np.float32)
         self._H_2d, _ = cv2.findHomography(ordered_corners, dst2d)
+        self._H_inv   = np.linalg.inv(self._H_2d)
 
-        # Build per-pixel median background
-        print("[INFO] Building median background ({} frames)…".format(
-            self.N_BG_SAMPLES))
+        # ── robot pixel footprint from homography ─────────────────────────
+        # Project ROBOT_SIZE_IN inches along both axes from the field centre;
+        # take the larger pixel distance.  Auto-scales to any camera setup.
+        c_f = np.array([[[72.0, 72.0]]], dtype=np.float32)
+        r_f = np.array([[[72.0 + self.ROBOT_SIZE_IN, 72.0]]], dtype=np.float32)
+        u_f = np.array([[[72.0, 72.0 + self.ROBOT_SIZE_IN]]], dtype=np.float32)
+        c_px = cv2.perspectiveTransform(c_f, self._H_inv)[0][0]
+        r_px = cv2.perspectiveTransform(r_f, self._H_inv)[0][0]
+        u_px = cv2.perspectiveTransform(u_f, self._H_inv)[0][0]
+        px_x = math.hypot(r_px[0]-c_px[0], r_px[1]-c_px[1])
+        px_y = math.hypot(u_px[0]-c_px[0], u_px[1]-c_px[1])
+        self._robot_max_px = max(px_x, px_y)
+        print("[INFO] Robot pixel footprint: {:.1f} px / 18 in".format(
+            self._robot_max_px))
+
+        # Neck-breaking kernel: ~15 % of robot width severs bridges
+        # narrower than ~2.7 " without eroding real robot blobs.
+        neck_r = max(3, int(self._robot_max_px * 0.15))
+        self._neck_kern = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (neck_r*2+1, neck_r*2+1))
+        print("[INFO] Neck-breaking kernel radius: {} px".format(neck_r))
+
+        # ── median background ─────────────────────────────────────────────
         cap2 = cv2.VideoCapture(video_path)
         n_total = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT))
         indices  = np.linspace(0, n_total - 1, self.N_BG_SAMPLES, dtype=int)
-        frames   = []
+        bar = _make_bar("Building background", len(indices))
+        frames = []
         for idx in indices:
             cap2.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
             ret, f = cap2.read()
             if ret:
                 frames.append(f.astype(np.float32))
+            bar.next()
+        bar.finish()
         cap2.release()
 
-        if frames:
-            self._bg = np.median(frames, axis=0).astype(np.uint8)
-        else:
-            self._bg = np.zeros((h, w, 3), dtype=np.uint8)
+        self._bg = (np.median(frames, axis=0).astype(np.uint8)
+                    if frames else np.zeros((h, w, 3), dtype=np.uint8))
         print("[INFO] Background ready.")
 
+    # ── main update ───────────────────────────────────────────────────────
+
     def update(self, frame, _H=None):
-        """Process one frame and return 4 RobotPoses."""
         if self._bg is None or self._H_2d is None:
             for p in self.tracked_poses:
                 p.visible = False
@@ -227,52 +287,79 @@ class RobotTracker:
 
         blobs = self._get_blobs(frame)
 
-        # ── initialise on first frame with ≥ 4 blobs ────────────────────
+        # ── initialise on first frame with ≥4 blobs ──────────────────────
         if not self._initialized:
             if len(blobs) < 4:
                 for p in self.tracked_poses:
                     p.visible = False
                 return self.tracked_poses
-            # Assign left → right by field X for stable IDs
             for i, b in enumerate(sorted(blobs[:4], key=lambda b: b[0])):
-                self._pos[i]   = (b[0], b[1])
-                self._coast[i] = 0
-                self.tracked_poses[i].x_in    = b[0]
-                self.tracked_poses[i].y_in    = b[1]
-                self.tracked_poses[i].heading = b[2]
+                fx, fy, hdg, _pid, cx, cy, _cnt = b
+                self._pos[i]    = (fx, fy)
+                self._pos_px[i] = (cx, cy)
+                self._coast[i]  = 0
+                self.tracked_poses[i].x_in    = fx
+                self.tracked_poses[i].y_in    = fy
+                self.tracked_poses[i].heading = hdg
                 self.tracked_poses[i].visible = True
             self._initialized = True
             return self.tracked_poses
 
-        # ── greedy nearest-neighbour assignment ──────────────────────────
-        used = set()
-        for i in range(4):
-            best_d, best_j = self.MAX_DIST_IN, -1
-            if self._pos[i] is None:
-                for j in range(len(blobs)):
-                    if j not in used:
-                        best_j = j
-                        break
-            else:
-                px, py = self._pos[i]
-                for j, (bx, by, _) in enumerate(blobs):
-                    if j in used:
-                        continue
-                    d = math.hypot(bx - px, by - py)
-                    if d < best_d:
-                        best_d, best_j = d, j
+        # ── globally optimal assignment ───────────────────────────────────
+        assignment = self._assign(blobs)
 
-            if best_j >= 0:
-                bx, by, heading = blobs[best_j]
-                self._pos[i]   = (bx, by)
-                self._coast[i] = 0
-                self.tracked_poses[i].x_in    = bx
-                self.tracked_poses[i].y_in    = by
-                self.tracked_poses[i].heading = heading
-                self.tracked_poses[i].visible = True
-                used.add(best_j)
+        # ── detect merged blobs ───────────────────────────────────────────
+        pid_to_contour = {}
+        for b in blobs:
+            if b[3] not in pid_to_contour:
+                pid_to_contour[b[3]] = b[6]
+
+        pid_to_tracks = defaultdict(list)
+        for ti, bi in assignment.items():
+            pid_to_tracks[blobs[bi][3]].append(ti)
+        merged_pids = {pid: tl for pid, tl in pid_to_tracks.items() if len(tl) > 1}
+
+        # ── update / create merge groups ──────────────────────────────────
+        active_keys = set()
+        for pid, tlist in merged_pids.items():
+            key = frozenset(tlist)
+            active_keys.add(key)
+            if key not in self._merge_groups:
+                self._merge_groups[key] = self._create_merge_group(tlist, pid)
+                print("[INFO] Merge started: tracks {}".format(sorted(tlist)))
             else:
-                self._coast[i] += 1
+                mg = self._merge_groups[key]
+                mg.parent_id = pid
+                if pid in pid_to_contour:
+                    self._update_crossing(mg, pid_to_contour[pid])
+
+        # ── resolve separations ───────────────────────────────────────────
+        for key in list(self._merge_groups.keys()):
+            if key not in active_keys:
+                mg = self._merge_groups.pop(key)
+                self._apply_separation(mg)
+
+        # ── tracks currently inside a merge (position frozen) ────────────
+        merged_tracks = set()
+        for mg in self._merge_groups.values():
+            merged_tracks.update(mg.track_ids)
+
+        # ── apply per-track updates ───────────────────────────────────────
+        for i in range(4):
+            if i in assignment:
+                fx, fy, hdg, pid, cx, cy, _cnt = blobs[assignment[i]]
+                self._coast[i] = 0
+                self.tracked_poses[i].x_in    = fx
+                self.tracked_poses[i].y_in    = fy
+                self.tracked_poses[i].heading = hdg
+                self.tracked_poses[i].visible = True
+                if i not in merged_tracks:
+                    self._pos[i]    = (fx, fy)
+                    self._pos_px[i] = (cx, cy)
+            else:
+                # Cap coast counter so it never overflows and the track
+                # remains re-acquirable if a blob reappears near it later.
+                self._coast[i] = min(self._coast[i] + 1, self.MAX_COAST + 1)
                 self.tracked_poses[i].visible = (
                     self._coast[i] <= self.MAX_COAST
                     and self._pos[i] is not None)
@@ -282,16 +369,166 @@ class RobotTracker:
 
         return self.tracked_poses
 
-    # ── blob detector ────────────────────────────────────────────────────
+    # ── optimal assignment ────────────────────────────────────────────────
 
-    def _foreground_contours(self, frame):
+    def _assign(self, blobs: list) -> Dict[int, int]:
         """
-        Return (all_contours, split_centers) from the foreground mask.
-        all_contours : every contour above BLOB_MIN, sorted area desc.
-                       Used to draw white/yellow outlines.
-        split_centers: list of (cx_px, cy_px) — the actual sub-centers
-                       produced by _split_contour(), i.e. what _get_blobs
-                       would use.  Drawn as small crosses in the overlay.
+        Build a 4×(N+4) cost matrix where the last 4 columns are "skip" slots —
+        one per track — at a fixed skip cost.
+
+        Adding skip columns means the solver can leave a track unassigned (by
+        routing it to its own skip slot) rather than forcing it onto a distant
+        blob it doesn't actually own.  This is the critical fix for coasting
+        tracks stealing blobs from their real owners.
+
+        Skip cost = 2.0 (twice the scale distance).  A track only skips when
+        every real blob is more than 2× MAX_DIST_IN away — i.e. truly out of
+        reach.  Coasting tracks with no prior use skip cost 1.0 so they
+        preferentially stay unassigned until they have a position to anchor on.
+
+        Cost for real blobs = distance_inches / MAX_DIST_IN (soft, no cutoff).
+        """
+        np = self.np
+        n = len(blobs)
+
+        # Build real-blob cost columns
+        INF       = 1e9
+        SKIP_COST = 2.0   # skip is always available; only chosen if all blobs are far
+
+        real_cost = np.full((4, max(n, 1)), INF, dtype=np.float64)
+        for i in range(4):
+            if self._pos[i] is None:
+                # No prior position yet — neutral cost so we don't steal blobs
+                real_cost[i, :] = SKIP_COST * 0.9
+                continue
+            px, py = self._pos[i]
+            for j, b in enumerate(blobs):
+                d = math.hypot(b[0]-px, b[1]-py)
+                real_cost[i, j] = d / self.MAX_DIST_IN
+
+        if n == 0:
+            return {}
+
+        # Append one skip column per track (diagonal identity block)
+        skip_cols = np.full((4, 4), INF, dtype=np.float64)
+        for i in range(4):
+            if self._pos[i] is not None:
+                # Long-coasting tracks get a lower skip cost so the solver
+                # prefers assigning them to a nearby blob over skipping again.
+                # coast=0 → skip_cost=SKIP_COST (normal)
+                # coast≥MAX_COAST → skip_cost=0.5 (eagerly re-acquire)
+                coast_frac = min(self._coast[i] / max(self.MAX_COAST, 1), 1.0)
+                skip_cost_i = SKIP_COST * (1.0 - 0.75 * coast_frac)
+            else:
+                skip_cost_i = SKIP_COST * 0.9
+            skip_cols[i, i] = skip_cost_i
+
+        cost = np.hstack([real_cost, skip_cols])   # shape (4, n+4)
+
+        try:
+            from scipy.optimize import linear_sum_assignment
+            row_ind, col_ind = linear_sum_assignment(cost)
+            assignment = {}
+            for r, c in zip(row_ind, col_ind):
+                if c < n:   # skip columns live at index n..n+3
+                    assignment[r] = c
+        except ImportError:
+            # Greedy fallback
+            assignment = {}
+            work = cost.copy()
+            total_cols = n + 4
+            for _ in range(4):
+                idx = int(np.argmin(work))
+                ri  = idx // total_cols
+                ci  = idx  % total_cols
+                if work[ri, ci] >= INF:
+                    break
+                if ci < n:
+                    assignment[ri] = ci
+                work[ri, :] = INF
+                work[:, ci] = INF
+
+        return assignment
+
+    # ── merge group lifecycle ─────────────────────────────────────────────
+
+    def _create_merge_group(self, track_ids: List[int], parent_id: int) -> MergeGroup:
+        np = self.np
+        positions = []
+        for tid in track_ids:
+            if self._pos_px[tid] is not None:
+                positions.append((tid, float(self._pos_px[tid][0]),
+                                       float(self._pos_px[tid][1])))
+            elif self._pos[tid] is not None:
+                pt = np.array([[[self._pos[tid][0], self._pos[tid][1]]]],
+                              dtype=np.float32)
+                ip = self.cv2.perspectiveTransform(pt, self._H_inv)[0][0]
+                positions.append((tid, float(ip[0]), float(ip[1])))
+            else:
+                positions.append((tid, 0.0, 0.0))
+
+        ax, ay = 1.0, 0.0
+        best = 0.0
+        for i in range(len(positions)):
+            for j in range(i+1, len(positions)):
+                dx = positions[j][1] - positions[i][1]
+                dy = positions[j][2] - positions[i][2]
+                d  = math.hypot(dx, dy)
+                if d > best:
+                    best = d
+                    ax, ay = dx/max(d, 1e-9), dy/max(d, 1e-9)
+
+        cx = sum(p[1] for p in positions) / len(positions)
+        cy = sum(p[2] for p in positions) / len(positions)
+
+        def _proj(px, py): return (px-cx)*ax + (py-cy)*ay
+        ordered     = sorted(positions, key=lambda p: _proj(p[1], p[2]))
+        ordered_ids = [p[0] for p in ordered]
+
+        return MergeGroup(track_ids=ordered_ids, entry_axis=(ax, ay),
+                          parent_id=parent_id, crossed=False)
+
+    def _update_crossing(self, mg: MergeGroup, contour) -> None:
+        cv2 = self.cv2
+        peaks = self._split_contour(contour)
+        if len(peaks) < 2:
+            return   # fully overlapping — preserve current state
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            return
+        mcx = M["m10"] / M["m00"]
+        mcy = M["m01"] / M["m00"]
+        ax, ay = mg.entry_axis
+
+        def _proj(px, py): return (px-mcx)*ax + (py-mcy)*ay
+        p0, p1 = sorted(peaks[:2], key=lambda p: _proj(p[0], p[1]))
+        dot = (p1[0]-p0[0])*ax + (p1[1]-p0[1])*ay
+        mg.crossed = (dot < 0)
+
+    def _apply_separation(self, mg: MergeGroup) -> None:
+        if mg.crossed:
+            tids = mg.track_ids
+            n    = len(tids)
+            sp   = [self._pos[tids[k]]    for k in range(n)]
+            sppx = [self._pos_px[tids[k]] for k in range(n)]
+            for k in range(n):
+                self._pos[tids[k]]    = sp[n-1-k]
+                self._pos_px[tids[k]] = sppx[n-1-k]
+            print("[INFO] Separation WITH crossing — swapped: {}".format(
+                sorted(mg.track_ids)))
+        else:
+            print("[INFO] Separation, no crossing — preserved: {}".format(
+                sorted(mg.track_ids)))
+
+    # ── foreground mask ───────────────────────────────────────────────────
+
+    def _foreground_mask(self, frame):
+        """
+        Background-subtraction fg mask with neck-breaking.
+
+        After the standard morphology pass, erode then dilate by the
+        physics-derived neck kernel.  This severs bridges narrower than
+        ~15 % of robot width without shrinking the robot blobs themselves.
         """
         cv2, np = self.cv2, self.np
         diff = cv2.absdiff(frame, self._bg)
@@ -300,118 +537,97 @@ class RobotTracker:
         fg = cv2.bitwise_and(fg, self._field_mask)
         fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self._kern)
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  self._kern)
+
+        if self._neck_kern is not None:
+            fg = cv2.erode(fg,  self._neck_kern)
+            fg = cv2.dilate(fg, self._neck_kern)
+
+        return fg
+
+    # ── blob detector ─────────────────────────────────────────────────────
+
+    def _foreground_contours(self, frame):
+        """Used by the debug overlay only."""
+        cv2, np = self.cv2, self.np
+        fg = self._foreground_mask(frame)
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid = sorted(
-            [c for c in cnts if cv2.contourArea(c) >= self.BLOB_MIN],
-            key=lambda c: -cv2.contourArea(c))
-        # Collect split centers for all valid contours
+        valid = sorted([c for c in cnts if cv2.contourArea(c) >= self.BLOB_MIN],
+                       key=lambda c: -cv2.contourArea(c))
         all_split = []
         for c in valid:
             area = float(cv2.contourArea(c))
             subs = self._split_contour(c)
-            per = area / max(len(subs), 1)
-            for (sx, sy) in subs:
+            per  = area / max(len(subs), 1)
+            for sx, sy in subs:
                 all_split.append((sx, sy, per))
         all_split.sort(key=lambda x: -x[2])
-        split_centers = [(int(sx), int(sy)) for sx, sy, _ in all_split]
-        return valid, split_centers
+        return valid, [(int(sx), int(sy)) for sx, sy, _ in all_split]
 
     def _split_contour(self, contour):
-        """
-        Use the distance transform to find individual robot centers within a
-        contour that may contain multiple touching/merged robots.
-
-        Returns a list of (cx_px, cy_px) image-pixel centers — one per
-        local maximum found in the distance transform of the filled contour.
-        A single isolated robot produces exactly one peak; two touching robots
-        produce two peaks; etc.
-        """
+        """Distance-transform peak detection; one centre per robot."""
         cv2, np = self.cv2, self.np
         h, w = self._field_mask.shape[:2]
-
-        # Rasterise just this contour into its own mask
         mask = np.zeros((h, w), dtype=np.uint8)
         cv2.drawContours(mask, [contour], -1, 255, -1)
-
-        # Distance transform: each pixel's value = distance to nearest edge
         dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
         if dist.max() == 0:
             return []
-
-        # Threshold at 40 % of the max distance to find "peak" regions.
-        # A single compact robot gives one peak region; two touching robots
-        # give two separate peak regions because there is a saddle point
-        # between them where the distance drops below 40 %.
-        _, peak_mask = cv2.threshold(
-            dist, dist.max() * 0.40, 255, cv2.THRESH_BINARY)
+        _, peak_mask = cv2.threshold(dist, dist.max() * 0.40, 255, cv2.THRESH_BINARY)
         peak_mask = peak_mask.astype(np.uint8)
-
-        # Erode to pull apart adjacent peak regions that still touch
         k_sep = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         peak_mask = cv2.erode(peak_mask, k_sep)
-
-        # Each connected component of the peak mask = one robot center
         n_labels, labels = cv2.connectedComponents(peak_mask)
         centers = []
         for lbl in range(1, n_labels):
             comp = (labels == lbl).astype(np.uint8)
             M = cv2.moments(comp)
             if M["m00"] > 0:
-                centers.append((M["m10"] / M["m00"],
-                                 M["m01"] / M["m00"]))
+                centers.append((M["m10"] / M["m00"], M["m01"] / M["m00"]))
         return centers
 
     def _get_blobs(self, frame):
         """
-        Return up to 4 (fx_in, fy_in, heading_rad) tuples, sorted by
-        blob area descending.
+        Return ALL valid sub-centres from ALL large-enough contours as
+        (fx_in, fy_in, heading, parent_id, cx_px, cy_px, contour).
 
-        Each foreground contour is passed through _split_contour() so that
-        merged / touching robots produce multiple centers rather than one
-        centroid halfway between them.
+        Not capped at 4 — the assignment step picks the best 4.
+        Previously the cap caused a merged blob (2 sub-centres) to starve
+        the other 2 solo robots out of the candidate pool.
         """
         cv2, np = self.cv2, self.np
-
-        diff = cv2.absdiff(frame, self._bg)
-        gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-        _, fg = cv2.threshold(gray, self.FG_THRESH, 255, cv2.THRESH_BINARY)
-        fg = cv2.bitwise_and(fg, self._field_mask)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self._kern)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  self._kern)
-
+        fg = self._foreground_mask(frame)
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Collect all candidate centers with their parent-blob area
         candidates = []
-        for c in cnts:
+        for parent_id, c in enumerate(cnts):
             area = float(cv2.contourArea(c))
             if area < self.BLOB_MIN:
                 continue
-            # Reject game balls: compute inscribed-circle radius via
-            # distance transform. Balls ≤8 px radius; robots ≥11 px.
             _bm = np.zeros(self._field_mask.shape, dtype=np.uint8)
             cv2.drawContours(_bm, [c], -1, 255, -1)
             _dr = cv2.distanceTransform(_bm, cv2.DIST_L2, 5)
             if _dr.max() < self.MIN_RADIUS_PX:
                 continue
             sub_centers = self._split_contour(c)
-            # Divide area equally among sub-centers for ranking purposes
-            per_center_area = area / max(len(sub_centers), 1)
-            for (cx, cy) in sub_centers:
+            if not sub_centers:
+                continue
+            per_area = area / len(sub_centers)
+            for cx, cy in sub_centers:
                 pt = np.array([[[cx, cy]]], dtype=np.float32)
                 fp = cv2.perspectiveTransform(pt, self._H_2d)[0][0]
                 fx, fy = float(fp[0]), float(fp[1])
                 if not (0 <= fx <= 144 and 0 <= fy <= 144):
                     continue
-                heading = 0.0  # heading from split center is unreliable
-                candidates.append((fx, fy, heading, per_center_area))
+                candidates.append((fx, fy, 0.0, per_area, parent_id,
+                                    int(cx), int(cy), c))
 
         candidates.sort(key=lambda b: -b[3])
-        return [(fx, fy, h) for fx, fy, h, _ in candidates[:4]]
+        return [(fx, fy, hdg, pid, cx, cy, cnt)
+                for fx, fy, hdg, _a, pid, cx, cy, cnt in candidates]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Field corner auto-detector (fallback when --corners not provided)
+# Field corner auto-detector
 # ─────────────────────────────────────────────────────────────────────────────
 class FieldDetector:
     def __init__(self, cv2, np):
@@ -475,10 +691,8 @@ def process_match(
     print("[INFO] Processing every {} frames (~{:.1f} fps output)".format(
         frame_step, video_fps / frame_step))
     if debug:
-        print("[INFO] Saving debug frame every {} processed frames".format(
-            debug_every_n))
+        print("[INFO] Saving debug frame every {} processed frames".format(debug_every_n))
 
-    # ── output files ─────────────────────────────────────────────────────
     csv_path    = os.path.join(output_dir, "robot_positions.csv")
     wpilog_path = os.path.join(output_dir, "match_log.wpilog")
     debug_dir   = os.path.join(output_dir, "tracker_debug") if debug else None
@@ -486,8 +700,8 @@ def process_match(
         os.makedirs(debug_dir, exist_ok=True)
 
     log = WPILogWriter(wpilog_path)
-    pose_eids = [log.start_entry("Robot{}/Pose".format(i), "double[]") for i in range(4)]
-    vis_eids  = [log.start_entry("Robot{}/Visible".format(i), "boolean") for i in range(4)]
+    pose_eids = [log.start_entry("Robot{}/Pose".format(i),    "double[]") for i in range(4)]
+    vis_eids  = [log.start_entry("Robot{}/Visible".format(i), "boolean")  for i in range(4)]
 
     csv_file   = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_file)
@@ -499,15 +713,11 @@ def process_match(
         "robot3_x_in","robot3_y_in","robot3_heading_rad","robot3_visible",
     ])
 
-    # ── set up tracker ───────────────────────────────────────────────────
     tracker        = RobotTracker(cv2, np)
     field_detector = FieldDetector(cv2, np)
 
-    ordered = None
-    H_2d    = None
-    H_inv   = None
+    ordered = None; H_2d = None; H_inv = None
 
-    # Read one frame to get shape
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     ret, sample_frame = cap.read()
     if not ret:
@@ -522,7 +732,6 @@ def process_match(
         H_inv = np.linalg.inv(H_2d)
         tracker.setup(video_path, ordered, frame_shape)
         print("[INFO] Manual corners loaded.")
-        # Save median background for debugging
         if tracker._bg is not None:
             bg_path = os.path.join(output_dir, "median_background.jpg")
             cv2.imwrite(bg_path, tracker._bg)
@@ -530,16 +739,12 @@ def process_match(
     else:
         print("[WARN] No corners — will attempt auto-detection.")
 
-    # ── main loop ────────────────────────────────────────────────────────
-    frame_num = start_frame
-    processed = 0
-    if start_frame > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    else:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    frame_num = start_frame; processed = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame if start_frame > 0 else 0)
 
     debug_colors = [(220,160,0),(0,220,255),(0,0,220),(0,120,255)]
-    print("[INFO] Processing…")
+    frames_to_process = max(1, (total_frames-start_frame+frame_step-1)//frame_step)
+    bar = _make_bar("Processing frames", frames_to_process)
 
     while True:
         ret, frame = cap.read()
@@ -553,21 +758,21 @@ def process_match(
         if (frame_num - start_frame) % frame_step != 0:
             continue
 
-        # Auto-detect corners if not provided
+        bar.next()
+
         if ordered is None:
             result = field_detector.detect_field(frame)
             if result is not None:
                 ordered, H_2d = result
                 H_inv = np.linalg.inv(H_2d)
                 tracker.setup(video_path, ordered, frame.shape)
-                print("  [t={:.1f}s] Field auto-detected.".format(match_time_s))
+                print("\n  [t={:.1f}s] Field auto-detected.".format(match_time_s))
                 if tracker._bg is not None:
-                    bg_path = os.path.join(output_dir, "median_background.jpg")
-                    cv2.imwrite(bg_path, tracker._bg)
+                    cv2.imwrite(os.path.join(output_dir, "median_background.jpg"),
+                                tracker._bg)
 
         poses = tracker.update(frame)
 
-        # ── write outputs ─────────────────────────────────────────────
         for i, p in enumerate(poses):
             log.write_pose2d(pose_eids[i], timestamp_us, p.x_m, p.y_m, p.heading)
             log.write_boolean(vis_eids[i], timestamp_us, p.visible)
@@ -578,18 +783,12 @@ def process_match(
                     "{:.4f}".format(p.heading), "1" if p.visible else "0"]
         csv_writer.writerow(row)
 
-        # ── debug frame ───────────────────────────────────────────────
         if debug and debug_dir and H_inv is not None:
             dbg = frame.copy()
             if ordered is not None:
-                cv2.polylines(dbg,
-                              [ordered.astype(np.int32).reshape(-1,1,2)],
+                cv2.polylines(dbg, [ordered.astype(np.int32).reshape(-1,1,2)],
                               True, (0, 200, 0), 2)
 
-            # Draw all foreground blobs and their split centers.
-            # Yellow outline = robot-sized (passes radius filter)
-            # Gray  outline = too small (ball or noise, filtered out)
-            # Cyan cross    = split center fed to the tracker
             if tracker._bg is not None:
                 all_cnts, split_centers = tracker._foreground_contours(frame)
                 for c in all_cnts:
@@ -606,13 +805,34 @@ def process_match(
                             bx2 = int(M2["m10"] / M2["m00"])
                             by2 = int(M2["m01"] / M2["m00"])
                             cv2.putText(dbg, "{:.0f}".format(area),
-                                        (bx2 - 15, by2 + 4),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                                        color, 1)
-                # Cyan crosses = split centers used by tracker
+                                        (bx2-15, by2+4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
                 for sx, sy in split_centers[:4]:
                     cv2.drawMarker(dbg, (sx, sy), (0, 255, 255),
                                    cv2.MARKER_CROSS, 16, 2)
+
+            # 18" reference circle
+            fh_d, fw_d = frame.shape[:2]
+            cv2.circle(dbg, (fw_d-40, 40),
+                       int(tracker._robot_max_px / 2), (80, 80, 80), 1)
+            cv2.putText(dbg, "18in", (fw_d-74, 57),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (80, 80, 80), 1)
+
+            # Merge group annotations
+            for mg in tracker._merge_groups.values():
+                pos_list = [tracker._pos_px[t] for t in mg.track_ids
+                            if tracker._pos_px[t] is not None]
+                if pos_list:
+                    mcx = int(sum(p[0] for p in pos_list) / len(pos_list))
+                    mcy = int(sum(p[1] for p in pos_list) / len(pos_list))
+                    ax, ay = mg.entry_axis
+                    ex = int(mcx+ax*50); ey = int(mcy+ay*50)
+                    col = (0, 80, 255) if mg.crossed else (0, 220, 100)
+                    cv2.arrowedLine(dbg, (mcx, mcy), (ex, ey), col, 2)
+                    lbl2 = "+".join("R{}".format(t) for t in mg.track_ids)
+                    lbl2 += " CROSSED" if mg.crossed else " ok"
+                    cv2.putText(dbg, lbl2, (mcx+6, mcy-8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
             n_drawn = 0
             fh, fw = frame.shape[:2]
@@ -627,14 +847,17 @@ def process_match(
                 col = debug_colors[i]
                 cv2.circle(dbg, (ix, iy), 16, col, -1)
                 cv2.circle(dbg, (ix, iy), 19, (255, 255, 255), 2)
-                cv2.putText(dbg, "R{}".format(i), (ix - 10, iy - 24),
+                cv2.putText(dbg, "R{}".format(i), (ix-10, iy-24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 dx = int(28 * math.cos(p.heading))
                 dy = int(-28 * math.sin(p.heading))
                 cv2.arrowedLine(dbg, (ix, iy), (ix+dx, iy+dy), (255,255,255), 2)
                 n_drawn += 1
 
-            lbl = "init" if not tracker._initialized else "{}/4".format(n_drawn)
+            n_merged = sum(len(mg.track_ids) for mg in tracker._merge_groups.values())
+            lbl = ("init" if not tracker._initialized else
+                   "{}/4 ({} merged)".format(n_drawn, n_merged) if n_merged else
+                   "{}/4".format(n_drawn))
             cv2.putText(dbg, "t={:.2f}s  [{}]".format(match_time_s, lbl),
                         (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
             if processed % debug_every_n == 0:
@@ -642,11 +865,8 @@ def process_match(
                             "frame_{:06d}.jpg".format(processed)), dbg)
 
         processed += 1
-        if processed % 50 == 0:
-            pct = (frame_num - start_frame) / max(1, total_frames - start_frame) * 100
-            print("  [{:.0f}%] t={:.1f}s | visible: {}/4".format(
-                pct, match_time_s, sum(1 for p in poses if p.visible)))
 
+    bar.finish()
     log.close(); csv_file.close(); cap.release()
     print("\n[DONE] {} frames processed.".format(processed))
     print("  CSV:    {}".format(csv_path))
@@ -665,13 +885,13 @@ def _print_instructions():
 |  2. File > Open Log(s) … > select match_log.wpilog               |
 |  3. "+" tab → 2D Field → set Field to FTC DECODE season          |
 |  4. Drag Robot0/Pose into Poses                                  |
-|  5. Click icon LEFT of the field name →                          |
+|  5. Click icon LEFT of the field name ->                         |
 |       Format: Pose2d   Units: Meters + Radians                   |
 |  6. Repeat for Robot1, Robot2, Robot3                            |
 |  7. Press play!                                                  |
 |                                                                  |
 |  Robot IDs: assigned left-to-right at match start.               |
-|  Use --debug to generate annotated frames for verification.       |
+|  Debug frames show merge axis + CROSSED/ok, and 18" ref circle.  |
 +------------------------------------------------------------------+
 """)
 
@@ -683,7 +903,26 @@ def download_video(url, output_dir):
     import subprocess
     out = os.path.join(output_dir, "match_video.mp4")
     print("[INFO] Downloading:", url)
-    subprocess.run(["yt-dlp", "-f", "best[ext=mp4]", "-o", out, url], check=True)
+    bar = _make_bar("Downloading", 100)
+    last_pct = 0
+    proc = subprocess.Popen(
+        ["yt-dlp", "-f", "best[ext=mp4]", "-o", out, url,
+         "--progress-template", "%(progress._percent_str)s"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if proc.stdout:
+        for line in proc.stdout:
+            try:
+                pct = int(float(line.strip().rstrip("%")))
+                while last_pct < pct:
+                    bar.next(); last_pct += 1
+            except ValueError:
+                pass
+    proc.wait()
+    while last_pct < 100:
+        bar.next(); last_pct += 1
+    bar.finish()
+    if proc.returncode != 0:
+        print("[ERROR] yt-dlp failed"); sys.exit(1)
     return out
 
 

@@ -1,29 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-auto_scout.py — FTC DECODE robot tracker  (v3.1)
+auto_scout.py — FTC DECODE robot tracker  (v3.2)
 
-Base: v3 topology-based merge tracking (the "better but still buggy" version).
-Changes in v3.1 — targeted fixes only, zero structural changes:
+Base: v3.1 topology-based merge tracking.
+Changes in v3.2 — fingerprint overhaul:
 
-  a) NECK-BREAKING  — after the standard morphology pass, erode the fg mask by
-     a physics-derived kernel (~15 % of robot pixel width) then dilate back.
-     Severs thin noise bridges between two nearby robots before contour-finding,
-     preventing spurious merges entirely.  Kernel size is computed from the
-     homography + known 18" robot footprint, so it auto-scales to any camera.
+  a) DOMINANT COLOR CLASSIFIER — each robot blob is immediately classified
+     into one of 4 perceptual color classes: WHITE, BLACK, COLORED, SILVER.
+     Classification uses the V (brightness) and S (saturation) channels of the
+     HSV median over the inner blob mask.  A white robot (high-V, low-S) gets a
+     completely different color class from a black/silver robot — this is a hard
+     discriminator that is reliable from frame 1, not a soft histogram cost that
+     ramps up over 8+ updates.
 
-  b) UNCAPPED CANDIDATE POOL  — _get_blobs now returns every valid sub-centre,
-     not capped at 4.  Previously a merged blob produced 2 split-centres and
-     consumed 2 of the 4 slots, starving the other 2 solo robots.
+  b) FULL HSV HISTOGRAM (H×S×V) — previously only H+S were used, ignoring
+     brightness entirely.  White vs silver vs black are distinguished purely by
+     V; adding it makes the histogram space much more discriminative.
 
-  c) GLOBAL OPTIMAL ASSIGNMENT  — replaced the greedy nearest-neighbour loop
-     with scipy.optimize.linear_sum_assignment (Hungarian algorithm).  Greedy
-     processed tracks 0→3 in order, so track 0 always grabbed the nearest blob
-     first; downstream tracks got leftovers.  A greedy fallback is used when
-     scipy is not installed.
+  c) TIGHTER FINGERPRINT GATES —
+       - Update threshold: d_fp < 0.45 (was 0.60)
+       - Penalty threshold: d_fp > 0.50 (was 0.65)
+       - Hard-reject threshold: d_fp > 0.80 → cost += 0.60 (new)
+     The dead zone between update and penalize is now 0.05 units, not 0.15.
 
-  d) SOFT DISTANCE COST  — distance is now a continuous cost (d / MAX_DIST_IN),
-     not a hard gate.  Robots that sprint beyond 30" between sampled frames are
-     no longer dropped.
+  d) FINGERPRINT ACTIVE FROM FRAME 1 — FP_MIN_UPDATES lowered to 3 (was 8).
+     The dominant color class is available immediately even before the
+     histogram stabilises, so the white robot is never mis-assigned.
+
+  e) HIGHER FINGERPRINT WEIGHT CAP — raised from 0.60 to 0.85.  For a robot
+     with a clearly distinctive color (white, bright orange, etc.) the color
+     signal should be allowed to dominate the cost matrix.
+
+  f) STREAK THRESHOLD RAISED to 3 (was 2) — reduces fingerprint corruption
+     from brief occlusion or lighting transients.
+
+  g) COLOR CLASS LOCK — once a track has accumulated ≥15 observations of the
+     same color class, that class is "locked".  Any blob whose dominant class
+     differs from the locked class pays a large additional cost (0.50), making
+     cross-class swaps essentially impossible regardless of distance.
 
 Usage:
   python3 auto_scout.py --no-download --video-path match.mp4 \\
@@ -152,21 +166,49 @@ class RobotPose:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class MergeGroup:
-    """
-    State for 2 (or more) tracks sharing a single foreground blob.
-
-    track_ids   : tracks sorted by projection onto entry_axis at merge time.
-                  Index 0 = most "negative" end of axis.
-    entry_axis  : unit vector (ax, ay) in IMAGE pixel space pointing from
-                  track_ids[0] toward track_ids[-1] at merge time.
-    parent_id   : contour parent_id of the current merged blob.
-    crossed     : True if dist-transform peaks have swapped sides relative to
-                  entry ordering.  Updated every frame during the merge.
-    """
     track_ids  : List[int]             = dc_field(default_factory=list)
     entry_axis : Tuple[float, float]   = (1.0, 0.0)
     parent_id  : int                   = -1
     crossed    : bool                  = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Color classes
+# ─────────────────────────────────────────────────────────────────────────────
+# Each blob is classified into one of these perceptual buckets using
+# the median HSV over its inner mask region.  The classification is
+# fast, parameter-free, and immediately available on frame 1.
+#
+# Class boundaries (HSV space, OpenCV conventions: H∈[0,179], S/V∈[0,255]):
+#
+#   WHITE   : V ≥ 180  AND  S < 60
+#   BLACK   : V < 70
+#   COLORED : S ≥ 80   (hue-dominant — orange, red, blue, green, etc.)
+#   SILVER  : everything else (mid-V, low-mid S — grey/metallic)
+#
+# These thresholds deliberately leave fuzzy gaps; a robot near a boundary
+# is not locked until ≥ COLOR_LOCK_N observations agree.
+
+COLOR_WHITE   = 0
+COLOR_BLACK   = 1
+COLOR_COLORED = 2
+COLOR_SILVER  = 3
+COLOR_UNKNOWN = 4
+
+_COLOR_NAMES = {COLOR_WHITE: "WHITE", COLOR_BLACK: "BLACK",
+                COLOR_COLORED: "COLORED", COLOR_SILVER: "SILVER",
+                COLOR_UNKNOWN: "UNKNOWN"}
+
+
+def classify_color(median_h, median_s, median_v):
+    """Return COLOR_* constant for a blob given its inner-mask HSV medians."""
+    if median_v >= 180 and median_s < 60:
+        return COLOR_WHITE
+    if median_v < 70:
+        return COLOR_BLACK
+    if median_s >= 80:
+        return COLOR_COLORED
+    return COLOR_SILVER
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,33 +217,31 @@ class MergeGroup:
 @dataclass
 class RobotFingerprint:
     """
-    Compact visual identity for one robot, built from its image-space crop.
-
-    color_hist  : normalised HSV histogram (H×S bins, hue-dominant).
-                  Rotation-invariant.  Strong discriminator for alliance color
-                  (red/blue bumpers) and chassis paint.  16 hue bins × 4 sat
-                  bins = 64 values.
-
-    edge_hist   : Canny edge density in N angular sectors around the blob
-                  centroid, then sorted and normalised so the absolute rotation
-                  angle doesn't matter — only the *shape* of the density
-                  profile.  12 sectors.  Captures superstructure silhouette.
-
-    n_updates   : how many solo-frame updates have been blended in.
-                  Fingerprint is considered reliable after FP_MIN_UPDATES.
-
-    EMA blend rate: 0.15 per frame so it adapts to lighting drift but
-    doesn't chase a wrong blob after a brief mis-assignment.
+    Stronger identity fingerprint (v3.2):
+      - inner_hist  : full HSV histogram (H×S×V) inside robot body
+      - ring_hist   : HSV histogram on outer ring / bumper edge
+      - edge_hist   : angular edge-energy profile around centroid
+      - shape_vec   : coarse shape stats
+      - color_class : dominant perceptual color class (WHITE/BLACK/…)
+      - color_votes : vote counts for each class (for lock detection)
     """
-    color_hist : Optional[object] = None   # np float32 array, 64 bins
-    edge_hist  : Optional[object] = None   # np float32 array, 12 bins
-    n_updates  : int               = 0
+    inner_hist  : Optional[object] = None
+    ring_hist   : Optional[object] = None
+    edge_hist   : Optional[object] = None
+    shape_vec   : Optional[object] = None
+    color_class : int  = COLOR_UNKNOWN
+    color_votes : object = None   # np.ndarray shape (5,), filled in on first update
+    n_updates   : int  = 0
 
-    FP_MIN_UPDATES = 8     # frames before fingerprint is trusted
-    EMA_ALPHA      = 0.15
-    H_BINS         = 16
-    S_BINS         = 4
-    EDGE_SECTORS   = 12
+    # ── tunables ──────────────────────────────────────────────────────────
+    FP_MIN_UPDATES  = 3      # was 8 — start influencing assignment immediately
+    EMA_ALPHA       = 0.12
+    H_BINS          = 12     # hue bins
+    S_BINS          = 4      # saturation bins
+    V_BINS          = 4      # brightness bins (NEW — distinguishes white/silver/black)
+    EDGE_SECTORS    = 12
+    COLOR_LOCK_N    = 15     # observations needed to lock color class
+    COLOR_LOCK_FRAC = 0.70   # fraction of votes that must agree to lock
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,11 +252,7 @@ class RobotTracker:
     Detect and track 4 robots using median background subtraction plus
     topology-aware merge handling.
 
-    Normal frames  : globally optimal assignment of blobs to tracks.
-    Merged frames  : dist-transform peaks watched inside the merged blob;
-                     crossing detected by monitoring which side of the entry
-                     axis each peak is on.
-    Separation     : if crossed → swap IDs; else → preserve IDs.
+    v3.2 improvements: see module docstring.
     """
 
     N_BG_SAMPLES  = 80
@@ -225,8 +261,20 @@ class RobotTracker:
     MIN_RADIUS_PX = 10
     KERNEL_PX     = 9
     MAX_COAST     = 60
-    MAX_DIST_IN   = 30.0   # scale for soft distance cost
-    ROBOT_SIZE_IN = 18.0   # FTC max robot footprint (inches)
+    MAX_DIST_IN   = 30.0
+    ROBOT_SIZE_IN = 18.0
+
+    # ── fingerprint assignment gates (tightened vs v3.1) ─────────────────
+    FP_UPDATE_MAX_DIST  = 0.45   # was 0.60 — only update when blob clearly matches
+    FP_PENALTY_MIN_DIST = 0.50   # was 0.65 — penalise bad matches sooner
+    FP_HARD_REJECT_DIST = 0.80   # NEW    — near-certain mismatch: large extra cost
+    FP_PENALTY_COST     = 0.25   # cost added when dist > FP_PENALTY_MIN_DIST
+    FP_HARD_REJECT_COST = 0.60   # cost added when dist > FP_HARD_REJECT_DIST
+    FP_WEIGHT_CAP       = 0.85   # was 0.60 — allow color to dominate
+    FP_STREAK_NEEDED    = 3      # was 2 — require more consecutive good frames
+
+    # Cost added when a blob's color class conflicts with a locked track class
+    COLOR_MISMATCH_COST = 0.50
 
     def __init__(self, cv2, np):
         self.cv2, self.np = cv2, np
@@ -236,25 +284,22 @@ class RobotTracker:
         self._H_inv        = None
         self._kern         = cv2.getStructuringElement(
                                  cv2.MORPH_ELLIPSE, (self.KERNEL_PX, self.KERNEL_PX))
-        self._neck_kern    = None   # set in setup()
-        self._robot_max_px = 60     # safe default; overwritten in setup()
+        self._neck_kern    = None
+        self._robot_max_px = 60
 
         self.tracked_poses  = [RobotPose() for _ in range(4)]
-        self._pos           = [None] * 4   # (x_in, y_in) field coords
-        self._pos_px        = [None] * 4   # (cx_px, cy_px) image coords
+        self._pos           = [None] * 4
+        self._pos_px        = [None] * 4
         self._coast         = [999]  * 4
         self._initialized   = False
 
-        # Per-track blob area history (image pixels²), up to 20 frames.
-        # Median used as a size prior in the cost matrix — rotation-invariant
-        # and robust to minor exterior changes.
         self._area_history  = [[] for _ in range(4)]
-
-        # Per-track visual fingerprints (color + edge)
+        self._fp_streak     = [0] * 4
         self._fingerprints  = [RobotFingerprint() for _ in range(4)]
 
-        # Cache last frame so _assign can call _build_fingerprint_fast
-        self._last_frame    = None
+        self._last_frame     = None
+        self._last_fp_obs: Dict[int, object] = {}
+        self._last_real_cost = None
 
         self._merge_groups: Dict[FrozenSet, MergeGroup] = {}
 
@@ -282,9 +327,6 @@ class RobotTracker:
         self._H_2d, _ = cv2.findHomography(ordered_corners, dst2d)
         self._H_inv   = np.linalg.inv(self._H_2d)
 
-        # ── robot pixel footprint from homography ─────────────────────────
-        # Project ROBOT_SIZE_IN inches along both axes from the field centre;
-        # take the larger pixel distance.  Auto-scales to any camera setup.
         c_f = np.array([[[72.0, 72.0]]], dtype=np.float32)
         r_f = np.array([[[72.0 + self.ROBOT_SIZE_IN, 72.0]]], dtype=np.float32)
         u_f = np.array([[[72.0, 72.0 + self.ROBOT_SIZE_IN]]], dtype=np.float32)
@@ -294,17 +336,13 @@ class RobotTracker:
         px_x = math.hypot(r_px[0]-c_px[0], r_px[1]-c_px[1])
         px_y = math.hypot(u_px[0]-c_px[0], u_px[1]-c_px[1])
         self._robot_max_px = max(px_x, px_y)
-        print("[INFO] Robot pixel footprint: {:.1f} px / 18 in".format(
-            self._robot_max_px))
+        print("[INFO] Robot pixel footprint: {:.1f} px / 18 in".format(self._robot_max_px))
 
-        # Neck-breaking kernel: ~15 % of robot width severs bridges
-        # narrower than ~2.7 " without eroding real robot blobs.
-        neck_r = max(3, int(self._robot_max_px * 0.22))
+        neck_r = max(3, int(self._robot_max_px * 0.15))
         self._neck_kern = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (neck_r*2+1, neck_r*2+1))
         print("[INFO] Neck-breaking kernel radius: {} px".format(neck_r))
 
-        # ── median background ─────────────────────────────────────────────
         cap2 = cv2.VideoCapture(video_path)
         n_total = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT))
         indices  = np.linspace(0, n_total - 1, self.N_BG_SAMPLES, dtype=int)
@@ -327,7 +365,8 @@ class RobotTracker:
 
     def update(self, frame, _H=None):
         cv2, np = self.cv2, self.np
-        self._last_frame = frame   # cache for fingerprint building inside _assign
+        self._last_frame  = frame
+        self._last_fp_obs = {}
         if self._bg is None or self._H_2d is None:
             for p in self.tracked_poses:
                 p.visible = False
@@ -335,7 +374,6 @@ class RobotTracker:
 
         blobs = self._get_blobs(frame)
 
-        # ── initialise on first frame with ≥4 blobs ──────────────────────
         if not self._initialized:
             if len(blobs) < 4:
                 for p in self.tracked_poses:
@@ -350,23 +388,28 @@ class RobotTracker:
                 self.tracked_poses[i].y_in    = fy
                 self.tracked_poses[i].heading = hdg
                 self.tracked_poses[i].visible = True
-                # Seed area history so the size prior is immediately active
                 init_area = float(cv2.contourArea(_cnt))
                 self._area_history[i] = [init_area] * 5
-                # Seed fingerprint from first frame crop
+                # Seed fingerprint including color class from frame 1
                 fp_obs = self._build_fingerprint(frame, _cnt, cx, cy)
                 if fp_obs is not None:
-                    ch, eh = fp_obs
-                    self._fingerprints[i].color_hist = ch.copy()
-                    self._fingerprints[i].edge_hist  = eh.copy()
-                    self._fingerprints[i].n_updates  = RobotFingerprint.FP_MIN_UPDATES
+                    ih, rh, eh, sv, cc, cv_hsv = fp_obs
+                    fp = self._fingerprints[i]
+                    fp.inner_hist = ih.copy()
+                    fp.ring_hist  = rh.copy()
+                    fp.edge_hist  = eh.copy()
+                    fp.shape_vec  = sv.copy()
+                    fp.color_class = cc
+                    fp.color_votes = np.zeros(5, dtype=np.float32)
+                    fp.color_votes[cc] = RobotFingerprint.FP_MIN_UPDATES
+                    fp.n_updates  = RobotFingerprint.FP_MIN_UPDATES
             self._initialized = True
+            print("[INFO] Tracks initialized with color classes: {}".format(
+                [_COLOR_NAMES[self._fingerprints[k].color_class] for k in range(4)]))
             return self.tracked_poses
 
-        # ── globally optimal assignment ───────────────────────────────────
         assignment = self._assign(blobs)
 
-        # ── detect merged blobs ───────────────────────────────────────────
         pid_to_contour = {}
         for b in blobs:
             if b[3] not in pid_to_contour:
@@ -377,7 +420,6 @@ class RobotTracker:
             pid_to_tracks[blobs[bi][3]].append(ti)
         merged_pids = {pid: tl for pid, tl in pid_to_tracks.items() if len(tl) > 1}
 
-        # ── update / create merge groups ──────────────────────────────────
         active_keys = set()
         for pid, tlist in merged_pids.items():
             key = frozenset(tlist)
@@ -391,18 +433,15 @@ class RobotTracker:
                 if pid in pid_to_contour:
                     self._update_crossing(mg, pid_to_contour[pid])
 
-        # ── resolve separations ───────────────────────────────────────────
         for key in list(self._merge_groups.keys()):
             if key not in active_keys:
                 mg = self._merge_groups.pop(key)
                 self._apply_separation(mg)
 
-        # ── tracks currently inside a merge (position frozen) ────────────
         merged_tracks = set()
         for mg in self._merge_groups.values():
             merged_tracks.update(mg.track_ids)
 
-        # ── apply per-track updates ───────────────────────────────────────
         for i in range(4):
             if i in assignment:
                 fx, fy, hdg, pid, cx, cy, _cnt = blobs[assignment[i]]
@@ -415,38 +454,85 @@ class RobotTracker:
                 if i not in merged_tracks:
                     self._pos[i]    = (fx, fy)
                     self._pos_px[i] = (cx, cy)
-                    # Record area for size prior (rotation-invariant)
                     hist = self._area_history[i]
                     hist.append(blob_area)
                     if len(hist) > 20:
                         hist.pop(0)
-                    # Update fingerprint via EMA (only on solo clean detections)
-                    fp_obs = self._build_fingerprint(frame, _cnt, cx, cy)
-                    if fp_obs is not None:
-                        ch, eh = fp_obs
-                        fp = self._fingerprints[i]
-                        a  = RobotFingerprint.EMA_ALPHA
-                        if fp.color_hist is None:
-                            fp.color_hist = ch.copy()
-                            fp.edge_hist  = eh.copy()
-                        else:
-                            fp.color_hist = (1-a)*fp.color_hist + a*ch
-                            fp.edge_hist  = (1-a)*fp.edge_hist  + a*eh
-                        fp.n_updates = min(fp.n_updates + 1, 200)
+
+                    bi = assignment[i]
+                    rc = self._last_real_cost
+                    assign_cost = float(rc[i, bi]) if (rc is not None and bi < rc.shape[1]) else 1.0
+                    confident = assign_cost < 0.6
+
+                    if confident and rc is not None and bi < rc.shape[1]:
+                        for i2 in range(4):
+                            if i2 != i and rc[i2, bi] - assign_cost < 0.15:
+                                confident = False
+                                break
+
+                    if confident and len(hist) >= 5:
+                        expected_a = float(self.np.median(hist[:-1]))
+                        if expected_a > 0 and blob_area / expected_a > 2.5:
+                            confident = False
+
+                    if confident:
+                        bi_key = assignment[i]
+                        fp_obs = self._last_fp_obs.get(bi_key)
+                        if fp_obs is None:
+                            fp_obs = self._build_fingerprint(frame, _cnt, cx, cy)
+
+                        if fp_obs is not None:
+                            fp = self._fingerprints[i]
+                            d_fp = self._fingerprint_distance(fp, fp_obs)
+
+                            # Tightened streak gate
+                            if d_fp < self.FP_UPDATE_MAX_DIST:
+                                self._fp_streak[i] = min(self._fp_streak[i] + 1, 8)
+                            else:
+                                self._fp_streak[i] = 0
+
+                            if self._fp_streak[i] >= self.FP_STREAK_NEEDED:
+                                ih, rh, eh, sv, cc, cv_hsv = fp_obs
+                                a = RobotFingerprint.EMA_ALPHA
+
+                                if fp.inner_hist is None:
+                                    fp.inner_hist  = ih.copy()
+                                    fp.ring_hist   = rh.copy()
+                                    fp.edge_hist   = eh.copy()
+                                    fp.shape_vec   = sv.copy()
+                                    fp.color_votes = np.zeros(5, dtype=np.float32)
+                                else:
+                                    fp.inner_hist  = (1 - a) * fp.inner_hist + a * ih
+                                    fp.ring_hist   = (1 - a) * fp.ring_hist  + a * rh
+                                    fp.edge_hist   = (1 - a) * fp.edge_hist  + a * eh
+                                    fp.shape_vec   = (1 - a) * fp.shape_vec  + a * sv
+
+                                # Update color vote tallies
+                                if fp.color_votes is None:
+                                    fp.color_votes = np.zeros(5, dtype=np.float32)
+                                fp.color_votes[cc] += 1.0
+
+                                # Re-derive dominant class from votes
+                                total_votes = float(fp.color_votes.sum())
+                                if total_votes >= 1:
+                                    best_class = int(np.argmax(fp.color_votes))
+                                    best_frac  = fp.color_votes[best_class] / total_votes
+                                    if (total_votes >= RobotFingerprint.COLOR_LOCK_N
+                                            and best_frac >= RobotFingerprint.COLOR_LOCK_FRAC):
+                                        if fp.color_class != best_class:
+                                            print("[INFO] Track {} color locked: {}".format(
+                                                i, _COLOR_NAMES[best_class]))
+                                        fp.color_class = best_class
+                                    else:
+                                        fp.color_class = best_class
+
+                                fp.n_updates = min(fp.n_updates + 1, 500)
                 else:
-                    # During a merge, slide _pos toward the shared blob centroid
-                    # so the cost matrix stays accurate at separation time.
                     if self._pos[i] is not None:
                         ox, oy = self._pos[i]
                         self._pos[i] = (ox * 0.7 + fx * 0.3,
                                         oy * 0.7 + fy * 0.3)
             else:
-                # ── dual-threshold fallback ──────────────────────────────
-                # If the standard threshold missed this track, check the
-                # permissive mask for a blob near its last known position.
-                # This recovers faint robots (similar colour to floor,
-                # shadows, brief lighting changes) without flooding the
-                # whole field with low-threshold noise.
                 recovered = False
                 if self._pos[i] is not None and self._bg is not None:
                     px_r, py_r = self._pos[i]
@@ -478,8 +564,6 @@ class RobotTracker:
                             best_blob = (fx2, fy2, int(bx2), int(by2))
                     if best_blob is not None:
                         fx2, fy2, cx2, cy2 = best_blob
-                        # Accept the fallback but don't reset coast fully —
-                        # it counts as a weak detection (coast stays, pos updates)
                         self._pos[i]    = (fx2, fy2)
                         self._pos_px[i] = (cx2, cy2)
                         self.tracked_poses[i].x_in = fx2
@@ -488,7 +572,6 @@ class RobotTracker:
                         recovered = True
 
                 if not recovered:
-                    # Cap coast counter so it never overflows
                     self._coast[i] = min(self._coast[i] + 1, self.MAX_COAST + 1)
                     self.tracked_poses[i].visible = (
                         self._coast[i] <= self.MAX_COAST
@@ -503,48 +586,61 @@ class RobotTracker:
 
     def _assign(self, blobs: list) -> Dict[int, int]:
         """
-        Build a 4×(N+4) cost matrix where the last 4 columns are "skip" slots —
-        one per track — at a fixed skip cost.
+        Cost matrix with per-blob color class and full fingerprint.
 
-        Adding skip columns means the solver can leave a track unassigned (by
-        routing it to its own skip slot) rather than forcing it onto a distant
-        blob it doesn't actually own.  This is the critical fix for coasting
-        tracks stealing blobs from their real owners.
-
-        Skip cost = 2.0 (twice the scale distance).  A track only skips when
-        every real blob is more than 2× MAX_DIST_IN away — i.e. truly out of
-        reach.  Coasting tracks with no prior use skip cost 1.0 so they
-        preferentially stay unassigned until they have a position to anchor on.
-
-        Cost for real blobs = distance_inches / MAX_DIST_IN (soft, no cutoff).
+        v3.2 additions:
+          - Compute blob color class up-front for each blob.
+          - Add COLOR_MISMATCH_COST when a blob's class conflicts with a
+            locked track color class.  This makes cross-class swaps nearly
+            impossible even when the robots are physically close.
+          - Tighter fingerprint penalty/hard-reject thresholds.
+          - Higher fp_weight cap (0.85).
         """
         np = self.np
         cv2 = self.cv2
         n = len(blobs)
 
-        # Build real-blob cost columns
         INF       = 1e9
-        SKIP_COST = 2.0   # skip is always available; only chosen if all blobs are far
+        SKIP_COST = 2.0
+
+        self._last_fp_obs: Dict[int, object] = {}
+
+        # Pre-compute color class for each blob (cheap — just HSV median)
+        blob_color_class = {}
+        for j, b in enumerate(blobs):
+            fp_obs = self._build_fingerprint_fast(b[6], b[4], b[5])
+            if fp_obs is not None:
+                blob_color_class[j] = fp_obs[4]   # index 4 = color_class
+                self._last_fp_obs[j] = fp_obs
+            else:
+                blob_color_class[j] = COLOR_UNKNOWN
 
         real_cost = np.full((4, max(n, 1)), INF, dtype=np.float64)
         for i in range(4):
             if self._pos[i] is None:
-                # No prior position yet — neutral cost so we don't steal blobs
                 real_cost[i, :] = SKIP_COST * 0.9
                 continue
             px, py = self._pos[i]
-            # Build size prior from area history
             hist = self._area_history[i]
             expected_area = float(np.median(hist)) if len(hist) >= 3 else None
             fp_i = self._fingerprints[i]
             fp_ready = fp_i.n_updates >= RobotFingerprint.FP_MIN_UPDATES
 
+            # Is this track's color class locked?
+            color_locked = (
+                fp_i.color_class != COLOR_UNKNOWN
+                and fp_i.color_votes is not None
+                and float(fp_i.color_votes.sum()) >= RobotFingerprint.COLOR_LOCK_N
+                and (float(fp_i.color_votes[fp_i.color_class])
+                     / max(float(fp_i.color_votes.sum()), 1.0))
+                     >= RobotFingerprint.COLOR_LOCK_FRAC
+            )
+
             for j, b in enumerate(blobs):
                 d = math.hypot(b[0]-px, b[1]-py)
                 dist_cost = d / self.MAX_DIST_IN
 
-                # ── size mismatch penalty ─────────────────────────────────
-                # Rotation-invariant; capped at 0.4 so it's a tiebreaker.
+                # Size mismatch penalty
                 if expected_area is not None and expected_area > 0:
                     blob_area = float(cv2.contourArea(b[6]))
                     ratio = blob_area / expected_area
@@ -552,53 +648,60 @@ class RobotTracker:
                 else:
                     size_penalty = 0.0
 
-                # ── ranked fingerprint cost ───────────────────────────────
-                # Tier 1: color histogram (always computed when FP is ready).
-                # Tier 2: edge histogram (added when color is ambiguous, i.e.
-                #         two candidates are within COLOR_AMBIG of each other).
-                # The fingerprint weight grows from 0→0.45 as n_updates rises,
-                # so early in the match we don't over-trust immature prints.
+                # ── Color class mismatch penalty (NEW in v3.2) ────────────
+                # If the track has a locked color class, penalise any blob
+                # whose dominant class is different and not UNKNOWN.
+                # This is the primary fix for the white-robot mis-assignment.
+                bcc = blob_color_class.get(j, COLOR_UNKNOWN)
+                color_cost = 0.0
+                if (color_locked
+                        and bcc != COLOR_UNKNOWN
+                        and bcc != fp_i.color_class):
+                    color_cost = self.COLOR_MISMATCH_COST
+
+                # ── Fingerprint cost ──────────────────────────────────────
                 fp_cost = 0.0
                 if fp_ready:
-                    fp_weight = min(0.45, (fp_i.n_updates - RobotFingerprint.FP_MIN_UPDATES)
-                                    / 30.0 * 0.45)
-                    fp_obs = self._build_fingerprint_fast(b[6], b[4], b[5])
+                    # Weight grows from 0.20 → FP_WEIGHT_CAP as n_updates rises
+                    fp_weight = min(
+                        self.FP_WEIGHT_CAP,
+                        0.20 + (fp_i.n_updates - RobotFingerprint.FP_MIN_UPDATES)
+                               / 15.0 * (self.FP_WEIGHT_CAP - 0.20)
+                    )
+                    fp_obs = self._last_fp_obs.get(j)
                     if fp_obs is not None:
-                        c_dist = self._bhattacharyya(fp_i.color_hist, fp_obs[0])
-                        e_dist = self._bhattacharyya(fp_i.edge_hist,  fp_obs[1])
-                        # Start with color only; blend in edge as needed
-                        fp_cost = fp_weight * (0.7 * c_dist + 0.3 * e_dist)
+                        d_fp = self._fingerprint_distance(fp_i, fp_obs)
+                        fp_cost = fp_weight * d_fp
+                        if d_fp > self.FP_HARD_REJECT_DIST:
+                            fp_cost += self.FP_HARD_REJECT_COST
+                        elif d_fp > self.FP_PENALTY_MIN_DIST:
+                            fp_cost += self.FP_PENALTY_COST
 
-                real_cost[i, j] = dist_cost + size_penalty + fp_cost
+                real_cost[i, j] = dist_cost + size_penalty + color_cost + fp_cost
 
         if n == 0:
             return {}
 
-        # Append one skip column per track (diagonal identity block)
         skip_cols = np.full((4, 4), INF, dtype=np.float64)
         for i in range(4):
             if self._pos[i] is not None:
-                # Long-coasting tracks get a lower skip cost so the solver
-                # prefers assigning them to a nearby blob over skipping again.
-                # coast=0 → skip_cost=SKIP_COST (normal)
-                # coast≥MAX_COAST → skip_cost=0.5 (eagerly re-acquire)
                 coast_frac = min(self._coast[i] / max(self.MAX_COAST, 1), 1.0)
                 skip_cost_i = SKIP_COST * (1.0 - 0.75 * coast_frac)
             else:
                 skip_cost_i = SKIP_COST * 0.9
             skip_cols[i, i] = skip_cost_i
 
-        cost = np.hstack([real_cost, skip_cols])   # shape (4, n+4)
+        cost = np.hstack([real_cost, skip_cols])
+        self._last_real_cost = real_cost
 
         try:
             from scipy.optimize import linear_sum_assignment
             row_ind, col_ind = linear_sum_assignment(cost)
             assignment = {}
             for r, c in zip(row_ind, col_ind):
-                if c < n:   # skip columns live at index n..n+3
+                if c < n:
                     assignment[r] = c
         except ImportError:
-            # Greedy fallback
             assignment = {}
             work = cost.copy()
             total_cols = n + 4
@@ -657,7 +760,7 @@ class RobotTracker:
         cv2 = self.cv2
         peaks = self._split_contour(contour)
         if len(peaks) < 2:
-            return   # fully overlapping — preserve current state
+            return
         M = cv2.moments(contour)
         if M["m00"] == 0:
             return
@@ -671,64 +774,175 @@ class RobotTracker:
         mg.crossed = (dot < 0)
 
     def _apply_separation(self, mg: MergeGroup) -> None:
-        if mg.crossed:
-            tids = mg.track_ids
-            n    = len(tids)
+        """
+        Resolve which track ID belongs to which exiting blob.
+
+        Primary: fingerprint color class (if any robot in the group has a
+                 locked class that differs from others, use it to disambiguate).
+        Secondary: topology crossing flag.
+        Tertiary: full fingerprint distance comparison.
+        """
+        tids = mg.track_ids
+        n    = len(tids)
+
+        # ── Color-class-based separation (NEW in v3.2) ────────────────────
+        # If two tracks have different locked color classes, and we have two
+        # blobs, assign the blob whose color matches each track's class.
+        if (n == 2
+                and self._last_frame is not None
+                and self._last_real_cost is not None):
+            fp0 = self._fingerprints[tids[0]]
+            fp1 = self._fingerprints[tids[1]]
+            cc0 = fp0.color_class
+            cc1 = fp1.color_class
+            if (cc0 != COLOR_UNKNOWN and cc1 != COLOR_UNKNOWN and cc0 != cc1):
+                rc = self._last_real_cost
+                n_blobs = rc.shape[1]
+                best0 = min(range(n_blobs), key=lambda j: rc[tids[0], j]) if n_blobs else None
+                best1 = min(range(n_blobs), key=lambda j: rc[tids[1], j]) if n_blobs else None
+                if best0 is not None and best1 is not None and best0 != best1:
+                    obs0 = self._last_fp_obs.get(best0)
+                    obs1 = self._last_fp_obs.get(best1)
+                    if obs0 is not None and obs1 is not None:
+                        bcc0 = obs0[4]
+                        bcc1 = obs1[4]
+                        # If blob0 matches track1's class better, swap
+                        match_a = (bcc0 == cc0 or bcc0 == COLOR_UNKNOWN) and \
+                                  (bcc1 == cc1 or bcc1 == COLOR_UNKNOWN)
+                        match_b = (bcc0 == cc1 or bcc0 == COLOR_UNKNOWN) and \
+                                  (bcc1 == cc0 or bcc1 == COLOR_UNKNOWN)
+                        if match_b and not match_a:
+                            sp   = [self._pos[tids[k]]    for k in range(n)]
+                            sppx = [self._pos_px[tids[k]] for k in range(n)]
+                            for k in range(n):
+                                self._pos[tids[k]]    = sp[n-1-k]
+                                self._pos_px[tids[k]] = sppx[n-1-k]
+                            print("[INFO] Separation swap (color-class) — tracks {}".format(
+                                sorted(tids)))
+                            return
+
+        # ── Fingerprint-distance-based separation ─────────────────────────
+        fp_swap = None
+        if (n == 2
+                and self._last_frame is not None
+                and self._last_real_cost is not None):
+            fp0 = self._fingerprints[tids[0]]
+            fp1 = self._fingerprints[tids[1]]
+            if (fp0.n_updates >= RobotFingerprint.FP_MIN_UPDATES * 2
+                    and fp1.n_updates >= RobotFingerprint.FP_MIN_UPDATES * 2):
+                rc = self._last_real_cost
+                n_blobs = rc.shape[1]
+                best0 = min(range(n_blobs), key=lambda j: rc[tids[0], j]) if n_blobs else None
+                best1 = min(range(n_blobs), key=lambda j: rc[tids[1], j]) if n_blobs else None
+                if best0 is not None and best1 is not None and best0 != best1:
+                    obs0 = self._last_fp_obs.get(best0)
+                    obs1 = self._last_fp_obs.get(best1)
+                    if obs0 is not None and obs1 is not None:
+                        score_a = (self._fingerprint_distance(fp0, obs0) +
+                                   self._fingerprint_distance(fp1, obs1))
+                        score_b = (self._fingerprint_distance(fp0, obs1) +
+                                   self._fingerprint_distance(fp1, obs0))
+                        fp_swap = score_b < score_a
+
+        if fp_swap is not None:
+            do_swap = fp_swap
+            src = "fingerprint"
+        else:
+            do_swap = mg.crossed
+            src = "topology"
+
+        if do_swap:
             sp   = [self._pos[tids[k]]    for k in range(n)]
             sppx = [self._pos_px[tids[k]] for k in range(n)]
             for k in range(n):
                 self._pos[tids[k]]    = sp[n-1-k]
                 self._pos_px[tids[k]] = sppx[n-1-k]
-            print("[INFO] Separation WITH crossing — swapped: {}".format(
-                sorted(mg.track_ids)))
+            print("[INFO] Separation swap ({}) — tracks {}".format(src, sorted(tids)))
         else:
-            print("[INFO] Separation, no crossing — preserved: {}".format(
-                sorted(mg.track_ids)))
+            print("[INFO] Separation no-swap ({}) — tracks {}".format(src, sorted(tids)))
 
     # ── fingerprint construction ──────────────────────────────────────────
 
     def _build_fingerprint(self, frame, contour, cx_px, cy_px):
         """
-        Build (color_hist, edge_hist) from a full frame + contour.
-        Used during track updates (has access to the original frame).
-        Returns None if the crop is too small to be reliable.
+        Build fingerprint from full HSV histogram (H×S×V, v3.2).
+
+        Returns (inner_hist, ring_hist, edge_hist, shape_vec, color_class,
+                 (median_h, median_s, median_v))
+        or None.
         """
         cv2, np = self.cv2, self.np
         h_fr, w_fr = frame.shape[:2]
 
         x, y, bw, bh = cv2.boundingRect(contour)
         pad = 4
-        x1 = max(0, x-pad); y1 = max(0, y-pad)
-        x2 = min(w_fr, x+bw+pad); y2 = min(h_fr, y+bh+pad)
-        if (x2-x1) < 10 or (y2-y1) < 10:
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(w_fr, x + bw + pad)
+        y2 = min(h_fr, y + bh + pad)
+        if (x2 - x1) < 10 or (y2 - y1) < 10:
             return None
 
         crop = frame[y1:y2, x1:x2].copy()
 
-        # Contour mask so floor pixels don't bleed into the histogram
         mask_full = np.zeros((h_fr, w_fr), dtype=np.uint8)
         cv2.drawContours(mask_full, [contour], -1, 255, -1)
         mask_crop = mask_full[y1:y2, x1:x2]
 
-        # ── color histogram (HSV, hue-focused, rotation-invariant) ────────
-        hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        H, S = RobotFingerprint.H_BINS, RobotFingerprint.S_BINS
-        ch   = cv2.calcHist([hsv], [0, 1], mask_crop,
-                             [H, S], [0, 180, 0, 256]).flatten().astype(np.float32)
-        s = ch.sum()
-        if s < 1:
+        inner_r = max(2, int(min(bw, bh) * 0.08))
+        inner_k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (inner_r * 2 + 1, inner_r * 2 + 1))
+        inner_mask = cv2.erode(mask_crop, inner_k)
+        ring_mask = cv2.subtract(mask_crop, inner_mask)
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        H = RobotFingerprint.H_BINS
+        S = RobotFingerprint.S_BINS
+        V = RobotFingerprint.V_BINS   # NEW dimension
+
+        def _hist3(mask):
+            """Full H×S×V histogram, normalised."""
+            hst = cv2.calcHist(
+                [hsv], [0, 1, 2], mask,
+                [H, S, V],
+                [0, 180, 0, 256, 0, 256]
+            ).flatten().astype(np.float32)
+            s = float(hst.sum())
+            if s < 1e-6:
+                return None
+            return hst / s
+
+        inner_hist = _hist3(inner_mask)
+        ring_hist  = _hist3(ring_mask)
+        if inner_hist is None:
             return None
-        ch /= s
+        if ring_hist is None:
+            ring_hist = inner_hist.copy()
 
-        # ── edge histogram (angular sectors, sorted for rotation tolerance) ──
+        # ── Dominant color classification from inner mask HSV medians ─────
+        hsv_inner = hsv[inner_mask > 0]   # shape (N, 3)
+        if len(hsv_inner) < 5:
+            # Fallback to full mask
+            hsv_inner = hsv[mask_crop > 0]
+        if len(hsv_inner) < 5:
+            return None
+
+        med_h = float(np.median(hsv_inner[:, 0]))
+        med_s = float(np.median(hsv_inner[:, 1]))
+        med_v = float(np.median(hsv_inner[:, 2]))
+        color_class = classify_color(med_h, med_s, med_v)
+
+        # Edge-energy by angular sector
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        sx   = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        sy   = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        mag  = np.sqrt(sx**2 + sy**2)
-        ang  = np.arctan2(sy, sx)   # -π .. π
-
-        # Only consider edge pixels inside the contour mask
+        sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.sqrt(sx**2 + sy**2)
         mag[mask_crop == 0] = 0
+
+        yy, xx = np.indices(gray.shape)
+        cx_loc = float(cx_px - x1)
+        cy_loc = float(cy_px - y1)
+        ang = np.arctan2(yy - cy_loc, xx - cx_loc)
 
         N = RobotFingerprint.EDGE_SECTORS
         eh = np.zeros(N, dtype=np.float32)
@@ -736,60 +950,94 @@ class RobotTracker:
         for k in range(N):
             lo = -math.pi + k * sector_w
             hi = lo + sector_w
-            in_sector = (ang >= lo) & (ang < hi)
+            in_sector = (ang >= lo) & (ang < hi if k < N-1 else ang <= hi)
             eh[k] = float(mag[in_sector].sum())
 
-        # Sort the sector histogram so absolute orientation doesn't matter.
-        # Two robots with the same structural silhouette but rotated differently
-        # will have the same sorted profile.
-        eh.sort()
-        es = eh.sum()
-        if es < 1:
+        es = float(eh.sum())
+        if es < 1e-6:
             eh[:] = 1.0 / N
         else:
             eh /= es
 
-        return ch, eh
+        area = float(cv2.contourArea(contour))
+        rect_area = max(float(bw * bh), 1.0)
+        hull = cv2.convexHull(contour)
+        hull_area = max(float(cv2.contourArea(hull)), 1.0)
+        solidity = max(0.0, min(1.0, area / hull_area))
+        extent   = max(0.0, min(1.0, area / rect_area))
+        aspect   = max(bw, bh) / max(min(bw, bh), 1)
+        aspect   = max(0.0, min(1.0, aspect / 3.0))
+
+        hu = cv2.HuMoments(cv2.moments(contour)).flatten()
+        hu = np.nan_to_num(-np.sign(hu) * np.log10(np.abs(hu) + 1e-12),
+                           nan=0.0, posinf=0.0, neginf=0.0)
+        hu = np.clip(hu[:3] / 10.0, -1.0, 1.0).astype(np.float32)
+        shape_vec = np.array([solidity, extent, aspect,
+                               hu[0], hu[1], hu[2]], dtype=np.float32)
+
+        return inner_hist, ring_hist, eh, shape_vec, color_class, (med_h, med_s, med_v)
 
     def _build_fingerprint_fast(self, contour, cx_px, cy_px):
-        """
-        Lightweight fingerprint from the stored background-subtracted diff.
-        Used inside _assign where we don't have the original frame directly,
-        so we cache the last frame and work on the contour crop only.
-        Returns (color_hist, edge_hist) or None.
-        """
-        # _assign is called from update(), which has already stored the frame
-        # in self._last_frame (set at the top of update()).
         if self._last_frame is None:
             return None
         return self._build_fingerprint(self._last_frame, contour, cx_px, cy_px)
 
     @staticmethod
     def _bhattacharyya(h1, h2):
-        """
-        Bhattacharyya distance between two normalised histograms.
-        Returns 0.0 for identical, ~1.0 for orthogonal.
-        """
         import numpy as np_mod
         if h1 is None or h2 is None:
             return 0.5
         coeff = float(np_mod.sum(np_mod.sqrt(np_mod.clip(h1 * h2, 0, None))))
         coeff = max(min(coeff, 1.0), 1e-9)
-        return min(1.0, -math.log(coeff) / 3.0)   # normalise to [0,1]
+        return min(1.0, -math.log(coeff) / 3.0)
 
-    # ── improved blob splitting ───────────────────────────────────────────
+    def _circular_bhattacharyya(self, h1, h2):
+        if h1 is None or h2 is None:
+            return 0.5
+        best = 1.0
+        for s in range(len(h2)):
+            d = self._bhattacharyya(h1, self.np.roll(h2, s))
+            if d < best:
+                best = d
+        return best
+
+    def _fingerprint_distance(self, fp, obs):
+        """
+        obs = (inner_hist, ring_hist, edge_hist, shape_vec, color_class, hsv_medians)
+        Lower is better.
+        """
+        if fp is None or obs is None:
+            return 0.75
+
+        ih, rh, eh, sv = obs[0], obs[1], obs[2], obs[3]
+        parts = []
+        weights = []
+
+        if fp.inner_hist is not None and ih is not None:
+            parts.append(self._bhattacharyya(fp.inner_hist, ih))
+            weights.append(0.35)
+
+        if fp.ring_hist is not None and rh is not None:
+            parts.append(self._bhattacharyya(fp.ring_hist, rh))
+            weights.append(0.35)
+
+        if fp.edge_hist is not None and eh is not None:
+            parts.append(self._circular_bhattacharyya(fp.edge_hist, eh))
+            weights.append(0.20)
+
+        if fp.shape_vec is not None and sv is not None:
+            d = float(self.np.linalg.norm(fp.shape_vec - sv))
+            parts.append(min(1.0, d / 1.5))
+            weights.append(0.10)
+
+        if not parts:
+            return 0.75
+
+        return float(sum(p * w for p, w in zip(parts, weights)) / sum(weights))
+
+    # ── blob splitting / watershed ────────────────────────────────────────
 
     def _split_contour(self, contour, seed_positions_px=None):
-        """
-        Distance-transform peak detection with optional watershed fallback.
-
-        If seed_positions_px is provided (list of (cx,cy) image-pixel points
-        for known track positions inside this contour), and the standard peak
-        detector only finds one peak despite the contour being large enough
-        for two robots, we use a marker-based watershed split seeded at the
-        known positions.  This handles the flat-face contact case where the
-        distance transform produces a single broad ridge.
-        """
         cv2, np = self.cv2, self.np
         h, w = self._field_mask.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
@@ -811,9 +1059,6 @@ class RobotTracker:
             if M["m00"] > 0:
                 centers.append((M["m10"] / M["m00"], M["m01"] / M["m00"]))
 
-        # ── watershed fallback for flat-face contact ──────────────────────
-        # If we only got 1 peak but the contour bbox is ≥1.5× a robot
-        # footprint and we have 2 known track seeds inside it, try watershed.
         if (len(centers) < 2
                 and seed_positions_px is not None
                 and len(seed_positions_px) == 2
@@ -827,60 +1072,33 @@ class RobotTracker:
         return centers
 
     def _watershed_split(self, binary_mask, seed_positions_px):
-        """
-        Marker-based watershed to split a binary mask into 2 regions.
-        seed_positions_px: list of 2 (cx, cy) pixel positions (image space).
-        Returns list of 2 centroids if successful, else [].
-        """
         cv2, np = self.cv2, self.np
         h, w = binary_mask.shape[:2]
-
-        # Build 3-channel image required by watershed
         img3 = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
-
-        # Create marker image: 1 and 2 for each seed, 0 for unknown
         markers = np.zeros((h, w), dtype=np.int32)
         seed_r  = max(4, int(self._robot_max_px * 0.1))
         for lbl, (sx, sy) in enumerate(seed_positions_px, start=1):
             sx, sy = int(sx), int(sy)
             if 0 <= sx < w and 0 <= sy < h:
                 cv2.circle(markers, (sx, sy), seed_r, lbl, -1)
-
-        # Background marker = 3 (pixels clearly outside contour)
-        bg_marker = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(bg_marker, [], -1, 255, -1)   # empty — no bg
-        # Dilate contour slightly then XOR to get a thin outer ring
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         dilated = cv2.dilate(binary_mask, kernel, iterations=2)
         outer   = cv2.bitwise_and(dilated, cv2.bitwise_not(binary_mask))
         markers[outer > 0] = 3
-
-        # Only run watershed if both seeds landed inside the mask
         if not (np.any(markers == 1) and np.any(markers == 2)):
             return []
-
         cv2.watershed(img3, markers)
-
         centers = []
         for lbl in [1, 2]:
             region = (markers == lbl).astype(np.uint8)
             M = cv2.moments(region)
             if M["m00"] > 0:
                 centers.append((M["m10"] / M["m00"], M["m01"] / M["m00"]))
-
         return centers if len(centers) == 2 else []
 
     # ── foreground mask ───────────────────────────────────────────────────
 
-
     def _foreground_mask(self, frame):
-        """
-        Background-subtraction fg mask with neck-breaking.
-
-        After the standard morphology pass, erode then dilate by the
-        physics-derived neck kernel.  This severs bridges narrower than
-        ~15 % of robot width without shrinking the robot blobs themselves.
-        """
         cv2, np = self.cv2, self.np
         diff = cv2.absdiff(frame, self._bg)
         gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
@@ -888,17 +1106,12 @@ class RobotTracker:
         fg = cv2.bitwise_and(fg, self._field_mask)
         fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self._kern)
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  self._kern)
-
         if self._neck_kern is not None:
             fg = cv2.erode(fg,  self._neck_kern)
             fg = cv2.dilate(fg, self._neck_kern)
-
         return fg
 
-    # ── blob detector ─────────────────────────────────────────────────────
-
     def _foreground_contours(self, frame):
-        """Used by the debug overlay only."""
         cv2, np = self.cv2, self.np
         fg = self._foreground_mask(frame)
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -914,38 +1127,7 @@ class RobotTracker:
         all_split.sort(key=lambda x: -x[2])
         return valid, [(int(sx), int(sy)) for sx, sy, _ in all_split]
 
-    # def _split_contour(self, contour, seed_positions_px=None):
-    #     """Distance-transform peak detection; one centre per robot."""
-    #     cv2, np = self.cv2, self.np
-    #     h, w = self._field_mask.shape[:2]
-    #     mask = np.zeros((h, w), dtype=np.uint8)
-    #     cv2.drawContours(mask, [contour], -1, 255, -1)
-    #     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    #     if dist.max() == 0:
-    #         return []
-    #     _, peak_mask = cv2.threshold(dist, dist.max() * 0.40, 255, cv2.THRESH_BINARY)
-    #     peak_mask = peak_mask.astype(np.uint8)
-    #     k_sep = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    #     peak_mask = cv2.erode(peak_mask, k_sep)
-    #     n_labels, labels = cv2.connectedComponents(peak_mask)
-    #     centers = []
-    #     for lbl in range(1, n_labels):
-    #         comp = (labels == lbl).astype(np.uint8)
-    #         M = cv2.moments(comp)
-    #         if M["m00"] > 0:
-    #             centers.append((M["m10"] / M["m00"], M["m01"] / M["m00"]))
-    #     return centers
-
     def _get_blobs(self, frame):
-        """
-        Return ALL valid sub-centres from ALL large-enough contours as
-        (fx_in, fy_in, heading, parent_id, cx_px, cy_px, contour).
-
-        For oversized contours (larger than 1.4× a single robot footprint),
-        we pass the known track pixel positions as watershed seeds so the
-        flat-face contact case can be split even when the distance transform
-        finds only one peak.
-        """
         cv2, np = self.cv2, self.np
         fg = self._foreground_mask(frame)
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -961,8 +1143,6 @@ class RobotTracker:
             if _dr.max() < self.MIN_RADIUS_PX:
                 continue
 
-            # For large blobs, build seed list from tracks whose last known
-            # pixel position falls inside the contour — enables watershed split.
             seeds = None
             x, y, bw, bh = cv2.boundingRect(c)
             if max(bw, bh) >= self._robot_max_px * 1.4 and self._initialized:
@@ -1179,7 +1359,6 @@ def process_match(
                     cv2.drawMarker(dbg, (sx, sy), (0, 255, 255),
                                    cv2.MARKER_CROSS, 16, 2)
 
-            # 18" reference circle
             fh_d, fw_d = frame.shape[:2]
             cv2.circle(dbg, (fw_d-40, 40),
                        int(tracker._robot_max_px / 2), (80, 80, 80), 1)
@@ -1215,8 +1394,11 @@ def process_match(
                 col = debug_colors[i]
                 cv2.circle(dbg, (ix, iy), 16, col, -1)
                 cv2.circle(dbg, (ix, iy), 19, (255, 255, 255), 2)
-                cv2.putText(dbg, "R{}".format(i), (ix-10, iy-24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                # Show color class in debug label
+                cc_name = _COLOR_NAMES.get(tracker._fingerprints[i].color_class, "?")
+                lbl_txt = "R{} {}".format(i, cc_name[:3])
+                cv2.putText(dbg, lbl_txt, (ix-10, iy-24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
                 dx = int(28 * math.cos(p.heading))
                 dy = int(-28 * math.sin(p.heading))
                 cv2.arrowedLine(dbg, (ix, iy), (ix+dx, iy+dy), (255,255,255), 2)
@@ -1259,7 +1441,8 @@ def _print_instructions():
 |  7. Press play!                                                  |
 |                                                                  |
 |  Robot IDs: assigned left-to-right at match start.               |
-|  Debug frames show merge axis + CROSSED/ok, and 18" ref circle.  |
+|  Debug frames show color class (WHI/BLK/COL/SIL) per track,     |
+|  merge axis + CROSSED/ok, and 18" ref circle.                    |
 +------------------------------------------------------------------+
 """)
 

@@ -166,11 +166,15 @@ class MergeGroup:
     parent_id   : contour parent_id of the current merged blob.
     crossed     : True if dist-transform peaks have swapped sides relative to
                   entry ordering.  Updated every frame during the merge.
+    peak_assignment : {track_id: (px, py)} — nearest dist-transform peak per
+                  track, updated every frame.  Used by _apply_separation to
+                  re-anchor tracks after a 3+ robot merge resolves.
     """
-    track_ids  : List[int]             = dc_field(default_factory=list)
-    entry_axis : Tuple[float, float]   = (1.0, 0.0)
-    parent_id  : int                   = -1
-    crossed    : bool                  = False
+    track_ids      : List[int]             = dc_field(default_factory=list)
+    entry_axis     : Tuple[float, float]   = (1.0, 0.0)
+    parent_id      : int                   = -1
+    crossed        : bool                  = False
+    peak_assignment: dict                  = dc_field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,8 +189,9 @@ class RobotTracker:
     Merged frames  : dist-transform peaks watched inside the merged blob;
                      crossing detected by monitoring which side of the entry
                      axis each peak is on.
-    Separation     : 2-robot merges may swap IDs; larger merges stay on the
-                     live assignment path instead of freezing the whole group.
+    Separation     : 2-robot merges may swap IDs; larger merges re-anchor each
+                     track to its closest dist-transform peak so they don't all
+                     collapse to the same centroid on separation.
     """
 
     N_BG_SAMPLES  = 80
@@ -198,11 +203,20 @@ class RobotTracker:
     MAX_DIST_IN   = 30.0   # scale for soft distance cost
     ROBOT_SIZE_IN = 18.0   # FTC max robot footprint (inches)
     MAX_SPEED_IN  = 120.0  # sanity cap for one-second field speed estimate
-    MAX_REACQ_IN  = 42.0   # don't snap a lost track onto far-away clutter
+    MAX_REACQ_IN  = 40.0   # don't snap a lost track onto far-away clutter
     REACQ_PX_PAD  = 1.6    # extra image-space slack while reacquiring
     VISIBLE_COAST = 8      # hide stale tracks quickly so they don't look frozen
-    MERGE_HOLD    = 12     # frames to reacquire conservatively after a merge
+    MERGE_HOLD    = 16     # frames to reacquire conservatively after a merge
     MERGE_DEBUG_HOLD = 0  # save every debug frame during/after a merge
+    EXPECT_2WAY_AREA = 1.6
+    EXPECT_3WAY_AREA = 2.6
+    EXPECT_4WAY_AREA = 3.5
+    RELAXED_PEAK_RATIO_MULTI = 0.30
+    RELAXED_PEAK_RATIO_PAIR  = 0.35
+    RELAXED_SEP_MULTI = 3
+    RELAXED_SEP_PAIR  = 5
+    MERGE_PRIOR_PAD_PX = 0.75
+    MERGE_PRIOR_MIN_SEP = 0.35
 
     def __init__(self, cv2, np):
         self.cv2, self.np = cv2, np
@@ -347,11 +361,10 @@ class RobotTracker:
             if key not in self._merge_groups:
                 self._merge_groups[key] = self._create_merge_group(tlist, pid)
                 print("[INFO] Merge started: tracks {}".format(sorted(tlist)))
-            else:
-                mg = self._merge_groups[key]
-                mg.parent_id = pid
-                if pid in pid_to_contour:
-                    self._update_crossing(mg, pid_to_contour[pid])
+            mg = self._merge_groups[key]
+            mg.parent_id = pid
+            if pid in pid_to_contour:
+                self._update_crossing(mg, pid_to_contour[pid])
             for tid in tlist:
                 self._merge_recent[tid] = self.MERGE_HOLD
 
@@ -363,12 +376,28 @@ class RobotTracker:
 
         # ── tracks currently inside a merge (position frozen) ────────────
         merged_tracks = set()
+        live_merge_tracks = {}
         for mg in self._merge_groups.values():
             if len(mg.track_ids) == 2:
                 merged_tracks.update(mg.track_ids)
+            else:
+                live_merge_tracks.update(mg.peak_assignment)
 
         # ── apply per-track updates ───────────────────────────────────────
         for i in range(4):
+            if i in live_merge_tracks:
+                px, py = live_merge_tracks[i]
+                pt = self.np.array([[[px, py]]], dtype=self.np.float32)
+                fp = self.cv2.perspectiveTransform(pt, self._H_2d)[0][0]
+                fx, fy = float(fp[0]), float(fp[1])
+                self._coast[i] = 0
+                self.tracked_poses[i].x_in = fx
+                self.tracked_poses[i].y_in = fy
+                self.tracked_poses[i].visible = True
+                self._update_track_motion(i, (fx, fy), (px, py))
+                self._pos[i] = (fx, fy)
+                self._pos_px[i] = (px, py)
+                continue
             if i in assignment:
                 fx, fy, hdg, pid, cx, cy, _qual, _nsplit, _cnt = blobs[assignment[i]]
                 self._coast[i] = 0
@@ -596,12 +625,12 @@ class RobotTracker:
                           parent_id=parent_id, crossed=False)
 
     def _update_crossing(self, mg: MergeGroup, contour) -> None:
-        if len(mg.track_ids) != 2:
-            return
         cv2 = self.cv2
         peaks = self._split_contour(contour)
+        n = len(mg.track_ids)
         if len(peaks) < 2:
             return   # fully overlapping — preserve current state
+
         M = cv2.moments(contour)
         if M["m00"] == 0:
             return
@@ -609,18 +638,71 @@ class RobotTracker:
         mcy = M["m01"] / M["m00"]
         ax, ay = mg.entry_axis
 
-        def _proj(px, py): return (px-mcx)*ax + (py-mcy)*ay
-        p0, p1 = sorted(peaks[:2], key=lambda p: _proj(p[0], p[1]))
-        dot = (p1[0]-p0[0])*ax + (p1[1]-p0[1])*ay
-        mg.crossed = (dot < 0)
+        def _proj(px, py): return (px - mcx) * ax + (py - mcy) * ay
+
+        # For 2-robot merges: original crossing logic unchanged
+        if n == 2:
+            p0, p1 = sorted(peaks[:2], key=lambda p: _proj(p[0], p[1]))
+            dot = (p1[0] - p0[0]) * ax + (p1[1] - p0[1]) * ay
+            mg.crossed = (dot < 0)
+            return
+
+        # For 3+ robot merges: assign each track to its nearest dist-transform
+        # peak and store the mapping in mg.peak_assignment so _apply_separation
+        # can re-anchor each track to its actual observed location.
+        sorted_peaks = sorted(peaks[:n], key=lambda p: _proj(p[0], p[1]))
+        assignment = {}
+        used_peaks = set()
+        # Sort tracks by their projection onto the entry axis, then greedily
+        # assign each to its nearest unused peak.
+        track_proj = []
+        for tid in mg.track_ids:
+            if self._pos_px[tid] is not None:
+                tp = _proj(self._pos_px[tid][0], self._pos_px[tid][1])
+            else:
+                tp = _proj(0.0, 0.0)
+            track_proj.append((tid, tp))
+        track_proj.sort(key=lambda x: x[1])
+        for tid, _ in track_proj:
+            tx, ty = self._predict_image_pos(tid)
+            best_d, best_k = float('inf'), None
+            for k, (px, py) in enumerate(sorted_peaks):
+                if k in used_peaks:
+                    continue
+                d = math.hypot(px - tx, py - ty)
+                if d < best_d:
+                    best_d, best_k = d, k
+            if best_k is not None:
+                assignment[tid] = sorted_peaks[best_k]
+                used_peaks.add(best_k)
+        mg.peak_assignment = assignment
 
     def _apply_separation(self, mg: MergeGroup) -> None:
         for tid in mg.track_ids:
             self._merge_recent[tid] = self.MERGE_HOLD
+
         if len(mg.track_ids) != 2:
-            print("[INFO] Multi-robot merge resolved: {}".format(
-                sorted(mg.track_ids)))
+            # For 3+ robot merges: snap each track to the dist-transform peak
+            # it was last assigned to, so they don't all collapse to the same
+            # centroid on separation and confuse the assignment step.
+            peak_assignment = mg.peak_assignment
+            reanchored = 0
+            for tid in mg.track_ids:
+                if tid in peak_assignment:
+                    px, py = peak_assignment[tid]
+                    pt = self.np.array([[[px, py]]], dtype=self.np.float32)
+                    fp = self.cv2.perspectiveTransform(pt, self._H_2d)[0][0]
+                    fx, fy = float(fp[0]), float(fp[1])
+                    if 0 <= fx <= 144 and 0 <= fy <= 144:
+                        self._pos[tid]    = (fx, fy)
+                        self._pos_px[tid] = (px, py)
+                        self._vel[tid]    = (0.0, 0.0)   # kill stale velocity
+                        self._vel_px[tid] = (0.0, 0.0)
+                        reanchored += 1
+            print("[INFO] Multi-robot merge resolved: {} — re-anchored {}/{} tracks".format(
+                sorted(mg.track_ids), reanchored, len(mg.track_ids)))
             return
+
         if mg.crossed:
             tids = mg.track_ids
             n    = len(tids)
@@ -713,11 +795,11 @@ class RobotTracker:
     def _expected_robot_count(self, contour_area: float) -> int:
         robot_area = max(self._robot_max_px * self._robot_max_px, 1.0)
         ratio = contour_area / robot_area
-        if ratio >= 3.5:
+        if ratio >= self.EXPECT_4WAY_AREA:
             return 4
-        if ratio >= 2.6:
+        if ratio >= self.EXPECT_3WAY_AREA:
             return 3
-        if ratio >= 1.6:
+        if ratio >= self.EXPECT_2WAY_AREA:
             return 2
         return 1
 
@@ -728,10 +810,11 @@ class RobotTracker:
 
         # Large pileups need a gentler peak extractor than the default
         # 40%-threshold + 7x7 erosion, which often merges 3 nearby maxima into 2.
-        peak_ratio = 0.30 if expected >= 3 else 0.35
+        peak_ratio = (self.RELAXED_PEAK_RATIO_MULTI
+                      if expected >= 3 else self.RELAXED_PEAK_RATIO_PAIR)
         _, peak_mask = cv2.threshold(dist, dist.max() * peak_ratio, 255, cv2.THRESH_BINARY)
         peak_mask = peak_mask.astype(np.uint8)
-        sep_size = 3 if expected >= 3 else 5
+        sep_size = self.RELAXED_SEP_MULTI if expected >= 3 else self.RELAXED_SEP_PAIR
         k_sep = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sep_size, sep_size))
         peak_mask = cv2.erode(peak_mask, k_sep)
         peak_mask = cv2.bitwise_and(peak_mask, mask)
@@ -827,7 +910,7 @@ class RobotTracker:
                 continue
             px, py = self._predict_image_pos(track_id)
             dist = self.cv2.pointPolygonTest(contour, (float(px), float(py)), True)
-            if dist >= -self._robot_max_px * 0.75:
+            if dist >= -self._robot_max_px * self.MERGE_PRIOR_PAD_PX:
                 nearby.append((dist, float(px), float(py)))
 
         target = min(max(expected, len(nearby)), 4)
@@ -835,7 +918,7 @@ class RobotTracker:
             return centers
 
         augmented = list(centers)
-        min_sep = max(self._robot_max_px * 0.35, 8.0)
+        min_sep = max(self._robot_max_px * self.MERGE_PRIOR_MIN_SEP, 6.0)
         nearby.sort(reverse=True)
         for _dist, px, py in nearby:
             too_close = any(math.hypot(px-cx, py-cy) < min_sep for cx, cy in augmented)
@@ -923,7 +1006,7 @@ def process_match(
     print("[INFO] Processing every {} frames (~{:.1f} fps output)".format(
         frame_step, video_fps / frame_step))
     if debug:
-        print("[INFO] Saving debug frame every {} processed frames".format(debug_every_n))
+        print("[INFO] Saving debug frame about every {} source frames".format(debug_every_n))
 
     csv_path    = os.path.join(output_dir, "robot_positions.csv")
     wpilog_path = os.path.join(output_dir, "match_log.wpilog")
@@ -985,6 +1068,7 @@ def process_match(
     bar = _make_bar("Processing frames", frames_to_process)
     merge_debug_hold = 0
     dense_merge_hold = 0
+    next_debug_source_frame = start_frame
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -1112,13 +1196,16 @@ def process_match(
             cv2.putText(dbg, "t={:.2f}s f={}  [{}]".format(
                         match_time_s, current_frame_num, lbl),
                         (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-            base_debug_interval = max(1, frame_step * max(debug_every_n, 1))
-            save_debug = ((current_frame_num - start_frame) % base_debug_interval == 0
+            base_debug_interval = max(1, debug_every_n)
+            save_debug = (current_frame_num >= next_debug_source_frame
                           or (SAVE_ALL_DEBUG_AROUND_MERGES and
                               (merge_active or merge_debug_hold > 0)))
             if save_debug:
                 cv2.imwrite(os.path.join(debug_dir,
                             "frame_{:06d}.jpg".format(current_frame_num)), dbg)
+                if current_frame_num >= next_debug_source_frame:
+                    while current_frame_num >= next_debug_source_frame:
+                        next_debug_source_frame += base_debug_interval
 
         processed += 1
 

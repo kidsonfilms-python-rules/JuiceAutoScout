@@ -1,48 +1,92 @@
 # FIRST Tech Challenge Automatic Scouter
 | Internal Codename | **Project REDACTED** |
-| -------- | --------|
-| rayID Designation |RE-016236-08 |
+| -------- | -------- |
+| rayID Designation | RE-016236-08 |
 
-*This project is developed by **Ray Enterprises' Advanced Research and Experimental Development Division** (ARED) for use by FTC Team Juice 16236*
+*This project is developed by **Ray Enterprises' Advanced Research and Experimental Development Division** (ARED) for use by FTC Team Juice 16236.*
 
 ## About AutoScout
-Tired of manually scouting? Let the computer do it for you! Feed it a match video and it will track and log the paths each robot take, each action they perform, and even collect stats on where they are able to make shots.
+`auto_scout.py` tracks the four robots in an FTC match video, projects them into field coordinates, and exports the result for later analysis.
 
-Take the outputted WPILogs and bring them into AdvantageScope to rewatch a match in 3D! Or use the outputted JLOGs (Juice Logs) and create charts and detected strategy diagrams automaticly with our tools for your strategy team.
+Current outputs are focused on robot motion:
+- `robot_positions.csv` for per-timestamp robot poses and visibility
+- `match_log.wpilog` for AdvantageScope playback
+- optional annotated debug frames in `output/tracker_debug/`
 
-## Usage - Quickstart
-### Step 1
-Clone this repo and install the necessary packages/setup the environment using the `setup.py` file
-### Step 2
-Run the following command to run the scouting:
-```shell
-python3 autoscout.py <YOUTUBE_URL>
-```
-## Optional Flags
-| Flag | Type | Default | Description |
-| -------- | -------- | -------- | --------|
-| `--output-dir` | `string` | `./output` | The folder that all outputted images, debug files, and logs will be stored |
-| `--start-offset` | `float` | `0.0` | Seconds to skip before the match timer starts (Saves processing time) |
-| `--sample-rate` | `int` | `10` | Frames per second to process |
-| `--debug` | - | Not Enabled | Saves annotated debug frames to `tracker_debug/` |
-| `--debug-every` | `int` | `5` | Save 1 debug frame every N processed frames |
-| `--no-download` | - | Not Enabled | Use local video instead of YouTube video. **`--video-path` is required** |
-| `--video-path` | `string` | `None` | Relative path to the locally stored match video. **`--no-download` is required** |
-| `--corners` | `string` | `None` | Import custom calibrated field-borders from `calibrate.py `. Feed in `field_corners.json` unless specificly changed.
+## Requirements
+Install the runtime dependencies:
 
-## Custom Field Calibration
-`autoscout.py` will attempt to detect the field edges and create a boundary, but if you want to manually specify the boundaries, run the following command:
 ```bash
-python3 calibrate.py <PATH_TO_LOCAL_FILE>
+pip install opencv-python numpy progress
+pip install scipy
 ```
-Please note the calibration app does not support YouTube videos.
-When the app opens, follow the onscreen directions to generate a `field_corners.json` file. Please note, if you choose to go manual, you will need to use the `--corners` flag when running the scouting file, and you will need to recalibrate everytime the camera angle changes during the event
+
+`scipy` is technically optional, but the tracker uses it for the best blob-to-track assignment.
+
+## Quickstart
+Track a local video:
+
+```bash
+python3 auto_scout.py --no-download --video-path match.mp4 --corners field_corners.json
+```
+
+Track from YouTube:
+
+```bash
+python3 auto_scout.py "https://www.youtube.com/watch?v=..."
+```
+
+## CLI Flags
+| Flag | Type | Default | Description |
+| -------- | -------- | -------- | -------- |
+| `--output-dir` | `string` | `./output` | Directory for CSV, WPILOG, background image, and debug frames |
+| `--start-offset` | `float` | `0.0` | Seconds to skip before the match timer starts |
+| `--sample-rate` | `float` | `10.0` | Effective frames per second to process |
+| `--debug` | - | disabled | Save annotated debug frames to `tracker_debug/` |
+| `--debug-every` | `int` | `5` | Save one debug frame about every `N` source-video frames |
+| `--no-download` | - | disabled | Use a local video instead of downloading from YouTube |
+| `--video-path` | `string` | `None` | Path to the local match video. Requires `--no-download` |
+| `--corners` | `string` | `None` | Path to `field_corners.json` from `calibrate.py` |
+
+## Field Calibration
+AutoScout can try to detect the field outline automatically, but manual calibration is more reliable.
+
+Generate field corners from a local video:
+
+```bash
+python3 calibrate.py path/to/match.mp4
+```
+
+That produces a `field_corners.json` file. Pass it to `auto_scout.py` with `--corners`. Recalibrate whenever the camera angle or crop changes.
 
 ## Outputs
-TBD I am still working on finalizing the Specs
+When a run finishes, the output directory typically contains:
 
-## JLOG File Schema
-JLOG is in a binary format that follows RULS (Ray Universal Log Schema). Please see below for the schema.
+- `robot_positions.csv`
+  Flat table of timestamped robot positions, headings, and visibility flags.
+- `match_log.wpilog`
+  WPILOG output for AdvantageScope.
+- `median_background.jpg`
+  The median background image used for subtraction.
+- `tracker_debug/`
+  Optional annotated frames showing contours, split centers, merge annotations, and robot IDs.
+
+## Debug Notes
+- `--debug-every` is based on source-video frame spacing, not processed-frame count.
+- Merge debug behavior can also be influenced by the top-level `SAVE_ALL_DEBUG_AROUND_MERGES` flag in `auto_scout.py`.
+- Each debug run clears old `.jpg` files from `output/tracker_debug/` before writing new ones.
+
+## AdvantageScope
+To inspect the resulting WPILOG:
+
+1. Open AdvantageScope.
+2. Open `match_log.wpilog`.
+3. Add a `2D Field` tab.
+4. Set the field to the FTC season field you want.
+5. Drag each `Robot#/Pose` entry into the field poses list.
 
 ## Contributing
-Please open a pull request with adequate information on the changes made. Keep PRs focused on a single issue (don't bundle multiple unrelated features/bug fixes into a single PR).
+Please open a focused pull request with a clear explanation of the change. Avoid bundling unrelated fixes into a single PR.
+
+## License
+This project is licensed under the MIT license, please see `LICENSE` for more information.

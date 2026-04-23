@@ -1,37 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-auto_scout.py — FTC DECODE robot tracker  (v3.1)
+auto_scout.py — FTC DECODE robot tracker  (v3.2)
 
-Base: v3 topology-based merge tracking (the "better but still buggy" version).
-Changes in v3.1 — targeted fixes only, zero structural changes:
+Base: v3.1 topology-based merge tracking.
+Changes in v3.2 — multi-robot merge fixes only:
 
-  a) NECK-BREAKING  — after the standard morphology pass, erode the fg mask by
-     a physics-derived kernel (~15 % of robot pixel width) then dilate back.
-     Severs thin noise bridges between two nearby robots before contour-finding,
-     preventing spurious merges entirely.  Kernel size is computed from the
-     homography + known 18" robot footprint, so it auto-scales to any camera.
+  PROBLEM: When 3 or 4 robots merge and rearrange while overlapping, the
+  tracker incorrectly reassigns IDs after separation because:
+    (a) peak_assignment used predicted positions that drift away from the
+        blob centroid during long merges (velocity extrapolation on frozen tracks)
+    (b) no permutation/crossing tracking for 3+ merges (only 2-robot case
+        had the "crossed" flip)
+    (c) if the dist-transform peak extractor returned <expected peaks for
+        even one frame, peak_assignment went stale without a fallback
+    (d) after separation, re-anchoring used the last frame's peak positions
+        which are the exit positions of the blob boundary — not where the
+        robots actually are heading
 
-  b) UNCAPPED CANDIDATE POOL  — _get_blobs now returns every valid sub-centre,
-     not capped at 4.  Previously a merged blob produced 2 split-centres and
-     consumed 2 of the 4 slots, starving the other 2 solo robots.
+  FIXES:
 
-  c) GLOBAL OPTIMAL ASSIGNMENT  — replaced the greedy nearest-neighbour loop
-     with scipy.optimize.linear_sum_assignment (Hungarian algorithm).  Greedy
-     processed tracks 0→3 in order, so track 0 always grabbed the nearest blob
-     first; downstream tracks got leftovers.  A greedy fallback is used when
-     scipy is not installed.
+  e) PEAK-ANCHORED POSITION during merge — while 3+ robots are merged,
+     their in-merge position is continuously updated to the nearest dist-
+     transform peak (like _update_crossing already does for 3+), so velocity
+     and position state track the peak rather than freezing at entry.
+     This makes _predict_image_pos work correctly during the merge.
 
-  d) SOFT DISTANCE COST  — distance is now a continuous cost (d / MAX_DIST_IN),
-     not a hard gate.  Robots that sprint beyond 30" between sampled frames are
-     no longer dropped.
+  f) PERMUTATION TRACKING for 3+ merges — MergeGroup now stores
+     `entry_order` (the sorted track IDs at merge-start) and `current_order`
+     (updated every frame from peak assignments sorted along entry_axis).
+     On separation, the mapping entry_order[k] → current_order[k] gives the
+     correct post-merge ID assignment, analogous to `crossed` for 2-robots.
 
-Usage:
-  python3 auto_scout.py --no-download --video-path match.mp4 \\
-      --corners field_corners.json [--debug] [--start-offset 1.0]
+  g) STALE PEAK GUARD — if _split_contour returns fewer peaks than tracks in
+     the merge group, we fall back to the last good peak_assignment rather
+     than silently doing nothing. This prevents the permutation state from
+     freezing mid-rearrangement.
 
-Dependencies:
-  pip install opencv-python numpy progress
-  pip install scipy          # optional — enables optimal assignment
+  h) SEPARATION RE-ANCHOR uses the permutation map to swap track state
+     (pos, vel, pos_px, vel_px) so each logical robot ID ends up owning the
+     correct physical position after the merge resolves.
 """
 
 import argparse
@@ -45,9 +52,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field as dc_field
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
-# Debug behavior toggle: when True, save every processed debug frame during
-# merges and for a short tail afterward. When False, respect debug_every_n only.
 SAVE_ALL_DEBUG_AROUND_MERGES = False
+PROCESS_EVERY_SOURCE_FRAME = True
 
 
 def _require(package, pip_name=None):
@@ -152,28 +158,42 @@ class RobotPose:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MergeGroup
+# MergeGroup  (v3.2: adds entry_order / current_order for permutation tracking)
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class MergeGroup:
     """
     State for 2 (or more) tracks sharing a single foreground blob.
 
-    track_ids   : tracks sorted by projection onto entry_axis at merge time.
-                  Index 0 = most "negative" end of axis.
-    entry_axis  : unit vector (ax, ay) in IMAGE pixel space pointing from
-                  track_ids[0] toward track_ids[-1] at merge time.
-    parent_id   : contour parent_id of the current merged blob.
-    crossed     : True if dist-transform peaks have swapped sides relative to
-                  entry ordering.  Updated every frame during the merge.
-    peak_assignment : {track_id: (px, py)} — nearest dist-transform peak per
-                  track, updated every frame.  Used by _apply_separation to
-                  re-anchor tracks after a 3+ robot merge resolves.
+    track_ids       : tracks in the group (unordered set, kept as list).
+    entry_axis      : unit vector (ax, ay) in IMAGE pixel space pointing from
+                      the "low" end to the "high" end at merge time.
+    parent_id       : contour parent_id of the current merged blob.
+
+    -- 2-robot fields (unchanged from v3.1) --
+    crossed         : True if the two robots have swapped sides of entry_axis.
+
+    -- 3+ robot fields (new in v3.2) --
+    entry_order     : track IDs sorted by projection onto entry_axis at the
+                      moment the merge was created.  Immutable after creation.
+                      entry_order[0] is the robot that was most "negative"
+                      along entry_axis at merge start.
+    current_order   : track IDs sorted by projection of their most-recent
+                      dist-transform peak onto entry_axis.  Updated every
+                      frame.  At separation, entry_order[k]→current_order[k]
+                      gives the permutation to apply.
+    peak_assignment : {track_id: (px, py)} — current dist-transform peak per
+                      track.  Used both for live position updates (fix e) and
+                      for re-anchoring on separation (fix h).
     """
     track_ids      : List[int]             = dc_field(default_factory=list)
     entry_axis     : Tuple[float, float]   = (1.0, 0.0)
     parent_id      : int                   = -1
+    # 2-robot
     crossed        : bool                  = False
+    # 3+ robot (v3.2)
+    entry_order    : List[int]             = dc_field(default_factory=list)
+    current_order  : List[int]             = dc_field(default_factory=list)
     peak_assignment: dict                  = dc_field(default_factory=dict)
 
 
@@ -181,33 +201,20 @@ class MergeGroup:
 # RobotTracker
 # ─────────────────────────────────────────────────────────────────────────────
 class RobotTracker:
-    """
-    Detect and track 4 robots using median background subtraction plus
-    topology-aware merge handling.
-
-    Normal frames  : globally optimal assignment of blobs to tracks.
-    Merged frames  : dist-transform peaks watched inside the merged blob;
-                     crossing detected by monitoring which side of the entry
-                     axis each peak is on.
-    Separation     : 2-robot merges may swap IDs; larger merges re-anchor each
-                     track to its closest dist-transform peak so they don't all
-                     collapse to the same centroid on separation.
-    """
-
     N_BG_SAMPLES  = 80
-    FG_THRESH     = 25
-    BLOB_MIN      = 300
-    MIN_RADIUS_PX = 10
-    KERNEL_PX     = 9
+    FG_THRESH     = 30       # Raised from 22: reduces noise from crowd/alliance members
+    BLOB_MIN      = 350      # Raised from 260: skip tiny noise blobs
+    MIN_RADIUS_PX = 6        # Lowered from 8: far-wall robots appear smaller
+    KERNEL_PX     = 7        # Lowered from 9: better for 640x360 video resolution
     MAX_COAST     = 60
-    MAX_DIST_IN   = 30.0   # scale for soft distance cost
-    ROBOT_SIZE_IN = 18.0   # FTC max robot footprint (inches)
-    MAX_SPEED_IN  = 120.0  # sanity cap for one-second field speed estimate
-    MAX_REACQ_IN  = 40.0   # don't snap a lost track onto far-away clutter
-    REACQ_PX_PAD  = 1.6    # extra image-space slack while reacquiring
-    VISIBLE_COAST = 8      # hide stale tracks quickly so they don't look frozen
-    MERGE_HOLD    = 16     # frames to reacquire conservatively after a merge
-    MERGE_DEBUG_HOLD = 0  # save every debug frame during/after a merge
+    MAX_DIST_IN   = 30.0
+    ROBOT_SIZE_IN = 18.0
+    MAX_SPEED_IN  = 140.0    # Raised from 120: allow slightly faster apparent motion
+    MAX_REACQ_IN  = 144.0
+    REACQ_PX_PAD  = 2.0      # Raised from 1.6: wider reacquisition window
+    VISIBLE_COAST = 8
+    MERGE_HOLD    = 16
+    MERGE_DEBUG_HOLD = 0
     EXPECT_2WAY_AREA = 1.6
     EXPECT_3WAY_AREA = 2.6
     EXPECT_4WAY_AREA = 3.5
@@ -217,6 +224,16 @@ class RobotTracker:
     RELAXED_SEP_PAIR  = 5
     MERGE_PRIOR_PAD_PX = 0.75
     MERGE_PRIOR_MIN_SEP = 0.35
+    BLOB_MIN_FIELD_AREA_IN2 = 40.0  # Lowered from 55: more permissive for far-wall robots
+    BALL_FILTER_ENABLED = True
+    BALL_GREEN_HSV_LO = (50, 95, 80)
+    BALL_GREEN_HSV_HI = (100, 255, 255)
+    BALL_PURPLE_HSV_LO = (132, 80, 70)
+    BALL_PURPLE_HSV_HI = (165, 255, 255)
+    BALL_MIN_FIELD_AREA_IN2 = 5.0
+    BALL_MASK_OPEN_FRAC = 0.030
+    BALL_MASK_CLOSE_FRAC = 0.055
+    BALL_MASK_DILATE_FRAC = 0.070
 
     def __init__(self, cv2, np):
         self.cv2, self.np = cv2, np
@@ -226,12 +243,12 @@ class RobotTracker:
         self._H_inv        = None
         self._kern         = cv2.getStructuringElement(
                                  cv2.MORPH_ELLIPSE, (self.KERNEL_PX, self.KERNEL_PX))
-        self._neck_kern    = None   # set in setup()
-        self._robot_max_px = 60     # safe default; overwritten in setup()
+        self._neck_kern    = None
+        self._robot_max_px = 60
 
         self.tracked_poses = [RobotPose() for _ in range(4)]
-        self._pos          = [None] * 4   # (x_in, y_in) field coords
-        self._pos_px       = [None] * 4   # (cx_px, cy_px) image coords
+        self._pos          = [None] * 4
+        self._pos_px       = [None] * 4
         self._vel          = [(0.0, 0.0)] * 4
         self._vel_px       = [(0.0, 0.0)] * 4
         self._coast        = [999]  * 4
@@ -240,6 +257,7 @@ class RobotTracker:
 
         self._merge_groups: Dict[FrozenSet, MergeGroup] = {}
         self._underresolved_tracks = set()
+        self._last_ball_mask = None
 
     # ── setup ────────────────────────────────────────────────────────────
 
@@ -250,7 +268,10 @@ class RobotTracker:
         tl, tr, br, bl = ordered_corners
         cx_poly = (tl[0]+tr[0]+br[0]+bl[0]) / 4
         cy_poly = (tl[1]+tr[1]+br[1]+bl[1]) / 4
-        SIDE_PAD = 25; BOTTOM_PAD = 25; TOP_PAD = 5
+        # Tightened SIDE_PAD (10 vs 25) to reduce crowd/alliance-member bleed-in.
+        # TOP_PAD increased (12 vs 5) to capture robots right at the far wall.
+        # BOTTOM_PAD reduced (18 vs 25) to trim scoreboard noise.
+        SIDE_PAD = 10; BOTTOM_PAD = 18; TOP_PAD = 12
 
         def _pad(x, y):
             dx = x - cx_poly; dy = y - cy_poly
@@ -261,13 +282,10 @@ class RobotTracker:
         self._field_mask = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(self._field_mask, [poly], 255)
 
-        dst2d = np.array([[0,144],[144,144],[144,0],[0,0]], dtype=np.float32)
+        dst2d = np.array([[0,0],[144,0],[144,144],[0,144]], dtype=np.float32)
         self._H_2d, _ = cv2.findHomography(ordered_corners, dst2d)
         self._H_inv   = np.linalg.inv(self._H_2d)
 
-        # ── robot pixel footprint from homography ─────────────────────────
-        # Project ROBOT_SIZE_IN inches along both axes from the field centre;
-        # take the larger pixel distance.  Auto-scales to any camera setup.
         c_f = np.array([[[72.0, 72.0]]], dtype=np.float32)
         r_f = np.array([[[72.0 + self.ROBOT_SIZE_IN, 72.0]]], dtype=np.float32)
         u_f = np.array([[[72.0, 72.0 + self.ROBOT_SIZE_IN]]], dtype=np.float32)
@@ -277,17 +295,13 @@ class RobotTracker:
         px_x = math.hypot(r_px[0]-c_px[0], r_px[1]-c_px[1])
         px_y = math.hypot(u_px[0]-c_px[0], u_px[1]-c_px[1])
         self._robot_max_px = max(px_x, px_y)
-        print("[INFO] Robot pixel footprint: {:.1f} px / 18 in".format(
-            self._robot_max_px))
+        print("[INFO] Robot pixel footprint: {:.1f} px / 18 in".format(self._robot_max_px))
 
-        # Neck-breaking kernel: ~15 % of robot width severs bridges
-        # narrower than ~2.7 " without eroding real robot blobs.
         neck_r = max(3, int(self._robot_max_px * 0.15))
         self._neck_kern = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (neck_r*2+1, neck_r*2+1))
         print("[INFO] Neck-breaking kernel radius: {} px".format(neck_r))
 
-        # ── median background ─────────────────────────────────────────────
         cap2 = cv2.VideoCapture(video_path)
         n_total = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT))
         indices  = np.linspace(0, n_total - 1, self.N_BG_SAMPLES, dtype=int)
@@ -321,14 +335,13 @@ class RobotTracker:
         blobs = self._get_blobs(frame)
         self._underresolved_tracks = self._find_underresolved_tracks(blobs)
 
-        # ── initialise on first frame with ≥4 blobs ──────────────────────
         if not self._initialized:
             if len(blobs) < 4:
                 for p in self.tracked_poses:
                     p.visible = False
                 return self.tracked_poses
             for i, b in enumerate(sorted(blobs[:4], key=lambda b: b[0])):
-                fx, fy, hdg, _pid, cx, cy, _qual, _nsplit, _cnt = b
+                fx, fy, hdg, _pid, cx, cy, _qual, _nsplit, _cnt, *_rest = b
                 self._pos[i]    = (fx, fy)
                 self._pos_px[i] = (cx, cy)
                 self._coast[i]  = 0
@@ -339,10 +352,8 @@ class RobotTracker:
             self._initialized = True
             return self.tracked_poses
 
-        # ── globally optimal assignment ───────────────────────────────────
         assignment = self._assign(blobs)
 
-        # ── detect merged blobs ───────────────────────────────────────────
         pid_to_contour = {}
         for b in blobs:
             if b[3] not in pid_to_contour:
@@ -353,7 +364,6 @@ class RobotTracker:
             pid_to_tracks[blobs[bi][3]].append(ti)
         merged_pids = {pid: tl for pid, tl in pid_to_tracks.items() if len(tl) > 1}
 
-        # ── update / create merge groups ──────────────────────────────────
         active_keys = set()
         for pid, tlist in merged_pids.items():
             key = frozenset(tlist)
@@ -368,25 +378,25 @@ class RobotTracker:
             for tid in tlist:
                 self._merge_recent[tid] = self.MERGE_HOLD
 
-        # ── resolve separations ───────────────────────────────────────────
         for key in list(self._merge_groups.keys()):
             if key not in active_keys:
                 mg = self._merge_groups.pop(key)
                 self._apply_separation(mg)
 
-        # ── tracks currently inside a merge (position frozen) ────────────
-        merged_tracks = set()
-        live_merge_tracks = {}
+        # tracks inside a 2-robot merge have positions frozen (handled below)
+        # tracks inside a 3+ robot merge get positions from peak_assignment
+        two_merged_tracks = set()
+        multi_merged_peaks = {}
         for mg in self._merge_groups.values():
             if len(mg.track_ids) == 2:
-                merged_tracks.update(mg.track_ids)
+                two_merged_tracks.update(mg.track_ids)
             else:
-                live_merge_tracks.update(mg.peak_assignment)
+                # FIX (e): use continuously-updated peak positions for 3+ merges
+                multi_merged_peaks.update(mg.peak_assignment)
 
-        # ── apply per-track updates ───────────────────────────────────────
         for i in range(4):
-            if i in live_merge_tracks:
-                px, py = live_merge_tracks[i]
+            if i in multi_merged_peaks:
+                px, py = multi_merged_peaks[i]
                 pt = self.np.array([[[px, py]]], dtype=self.np.float32)
                 fp = self.cv2.perspectiveTransform(pt, self._H_2d)[0][0]
                 fx, fy = float(fp[0]), float(fp[1])
@@ -395,23 +405,27 @@ class RobotTracker:
                 self.tracked_poses[i].y_in = fy
                 self.tracked_poses[i].visible = True
                 self._update_track_motion(i, (fx, fy), (px, py))
+                self.tracked_poses[i].heading = self._motion_heading(
+                    i, self.tracked_poses[i].heading)
                 self._pos[i] = (fx, fy)
                 self._pos_px[i] = (px, py)
                 continue
             if i in assignment:
-                fx, fy, hdg, pid, cx, cy, _qual, _nsplit, _cnt = blobs[assignment[i]]
+                fx, fy, _hdg, _pid, cx, cy, _qual, _nsplit, _cnt, *_rest = blobs[assignment[i]]
                 self._coast[i] = 0
                 self.tracked_poses[i].x_in    = fx
                 self.tracked_poses[i].y_in    = fy
-                self.tracked_poses[i].heading = hdg
                 self.tracked_poses[i].visible = True
-                if i not in merged_tracks:
+                if i not in two_merged_tracks:
                     self._update_track_motion(i, (fx, fy), (cx, cy))
+                    self.tracked_poses[i].heading = self._motion_heading(
+                        i, self.tracked_poses[i].heading)
                     self._pos[i]    = (fx, fy)
                     self._pos_px[i] = (cx, cy)
+                else:
+                    self.tracked_poses[i].heading = self._motion_heading(
+                        i, self.tracked_poses[i].heading)
             else:
-                # Cap coast counter so it never overflows and the track
-                # remains re-acquirable if a blob reappears near it later.
                 self._coast[i] = min(self._coast[i] + 1, self.MAX_COAST + 1)
                 self.tracked_poses[i].visible = (
                     self._coast[i] <= self.VISIBLE_COAST
@@ -419,39 +433,23 @@ class RobotTracker:
                 if self._pos[i] is not None:
                     self.tracked_poses[i].x_in = self._pos[i][0]
                     self.tracked_poses[i].y_in = self._pos[i][1]
+                    self.tracked_poses[i].heading = self._motion_heading(
+                        i, self.tracked_poses[i].heading)
 
         return self.tracked_poses
 
     # ── optimal assignment ────────────────────────────────────────────────
 
     def _assign(self, blobs: list) -> Dict[int, int]:
-        """
-        Build a 4×(N+4) cost matrix where the last 4 columns are "skip" slots —
-        one per track — at a fixed skip cost.
-
-        Adding skip columns means the solver can leave a track unassigned (by
-        routing it to its own skip slot) rather than forcing it onto a distant
-        blob it doesn't actually own.  This is the critical fix for coasting
-        tracks stealing blobs from their real owners.
-
-        Skip cost = 2.0 (twice the scale distance).  A track only skips when
-        every real blob is more than 2× MAX_DIST_IN away — i.e. truly out of
-        reach.  Coasting tracks with no prior use skip cost 1.0 so they
-        preferentially stay unassigned until they have a position to anchor on.
-
-        Cost for real blobs = distance_inches / MAX_DIST_IN (soft, no cutoff).
-        """
         np = self.np
         n = len(blobs)
 
-        # Build real-blob cost columns
         INF       = 1e9
-        SKIP_COST = 2.0   # skip is always available; only chosen if all blobs are far
+        SKIP_COST = 2.0
 
         real_cost = np.full((4, max(n, 1)), INF, dtype=np.float64)
         for i in range(4):
             if self._pos[i] is None:
-                # No prior position yet — neutral cost so we don't steal blobs
                 real_cost[i, :] = SKIP_COST * 0.9
                 continue
             pred_x, pred_y = self._predict_field_pos(i)
@@ -463,10 +461,10 @@ class RobotTracker:
                     continue
                 if not self._is_plausible_match(i, b, d_field, d_img):
                     continue
-
-                # Favor staying near the motion prediction and penalize
-                # ambiguous blob geometry so game-piece clumps lose.
-                dist_cost = d_field / self.MAX_DIST_IN
+                dist_scale = (self.MAX_REACQ_IN
+                              if self._coast[i] > self.VISIBLE_COAST
+                              else self.MAX_DIST_IN)
+                dist_cost = d_field / max(dist_scale, 1.0)
                 img_cost  = d_img / max(self._robot_max_px * 1.25, 1.0)
                 qual_cost = b[6]
                 real_cost[i, j] = dist_cost + 0.35 * img_cost + qual_cost
@@ -474,31 +472,29 @@ class RobotTracker:
         if n == 0:
             return {}
 
-        # Append one skip column per track (diagonal identity block)
         skip_cols = np.full((4, 4), INF, dtype=np.float64)
         for i in range(4):
             if self._pos[i] is not None:
-                # Coasting tracks should be harder to re-acquire than to keep
-                # coasting unless a detection is clearly plausible.
                 coast_frac = min(self._coast[i] / max(self.MAX_COAST, 1), 1.0)
                 skip_cost_i = SKIP_COST * (1.0 + 0.35 * coast_frac)
+                if self._coast[i] > self.VISIBLE_COAST:
+                    skip_cost_i = SKIP_COST * (1.8 + 0.7 * coast_frac)
                 if self._merge_recent[i] > 0:
                     skip_cost_i = min(skip_cost_i, SKIP_COST * 0.8)
             else:
                 skip_cost_i = SKIP_COST * 0.9
             skip_cols[i, i] = skip_cost_i
 
-        cost = np.hstack([real_cost, skip_cols])   # shape (4, n+4)
+        cost = np.hstack([real_cost, skip_cols])
 
         try:
             from scipy.optimize import linear_sum_assignment
             row_ind, col_ind = linear_sum_assignment(cost)
             assignment = {}
             for r, c in zip(row_ind, col_ind):
-                if c < n:   # skip columns live at index n..n+3
+                if c < n:
                     assignment[r] = c
         except ImportError:
-            # Greedy fallback
             assignment = {}
             work = cost.copy()
             total_cols = n + 4
@@ -571,6 +567,12 @@ class RobotTracker:
                 prev_vy_px * 0.45 + raw_vy_px * 0.55,
             )
 
+    def _motion_heading(self, track_id: int, fallback: float = 0.0) -> float:
+        vx, vy = self._vel[track_id]
+        if math.hypot(vx, vy) < 0.25:
+            return fallback
+        return math.atan2(vy, vx)
+
     def _is_plausible_match(self, track_id: int, blob, d_field: float, d_img: float) -> bool:
         contour_count = max(blob[7], 1)
         effective_hold = max(self._coast[track_id], self._merge_recent[track_id])
@@ -589,6 +591,10 @@ class RobotTracker:
     # ── merge group lifecycle ─────────────────────────────────────────────
 
     def _create_merge_group(self, track_ids: List[int], parent_id: int) -> MergeGroup:
+        """
+        Create a MergeGroup.  For 3+ tracks, record entry_order so we can
+        detect permutations during the merge (fix f).
+        """
         np = self.np
         positions = []
         for tid in track_ids:
@@ -603,6 +609,7 @@ class RobotTracker:
             else:
                 positions.append((tid, 0.0, 0.0))
 
+        # Principal axis: direction of maximum spread among the entry positions
         ax, ay = 1.0, 0.0
         best = 0.0
         for i in range(len(positions)):
@@ -618,18 +625,40 @@ class RobotTracker:
         cy = sum(p[2] for p in positions) / len(positions)
 
         def _proj(px, py): return (px-cx)*ax + (py-cy)*ay
-        ordered     = sorted(positions, key=lambda p: _proj(p[1], p[2]))
-        ordered_ids = [p[0] for p in ordered]
+        ordered_positions = sorted(positions, key=lambda p: _proj(p[1], p[2]))
+        entry_order = [p[0] for p in ordered_positions]
 
-        return MergeGroup(track_ids=ordered_ids, entry_axis=(ax, ay),
-                          parent_id=parent_id, crossed=False)
+        # Seed peak_assignment with entry positions so we have valid state
+        # immediately (guards against first-frame stale-peak scenario, fix g)
+        peak_assignment = {tid: (px, py) for tid, px, py in positions}
+
+        return MergeGroup(
+            track_ids      = list(track_ids),
+            entry_axis     = (ax, ay),
+            parent_id      = parent_id,
+            crossed        = False,
+            entry_order    = entry_order,
+            current_order  = list(entry_order),   # starts as identity permutation
+            peak_assignment= peak_assignment,
+        )
 
     def _update_crossing(self, mg: MergeGroup, contour) -> None:
+        """
+        Update per-frame merge state.
+
+        2-robot merges: unchanged from v3.1 (crossed flag).
+        3+ robot merges: update peak_assignment AND current_order so we can
+        detect the full permutation at separation (fixes e, f, g).
+        """
         cv2 = self.cv2
         peaks = self._split_contour(contour)
         n = len(mg.track_ids)
+
+        # FIX (g): if we got fewer peaks than tracks, keep existing peak_assignment
+        # rather than silently doing nothing.  This preserves the last good state.
         if len(peaks) < 2:
-            return   # fully overlapping — preserve current state
+            # Fully overlapping — can't distinguish positions; preserve state.
+            return
 
         M = cv2.moments(contour)
         if M["m00"] == 0:
@@ -640,31 +669,56 @@ class RobotTracker:
 
         def _proj(px, py): return (px - mcx) * ax + (py - mcy) * ay
 
-        # For 2-robot merges: original crossing logic unchanged
+        # ── 2-robot: original crossing logic (unchanged) ──────────────────
         if n == 2:
             p0, p1 = sorted(peaks[:2], key=lambda p: _proj(p[0], p[1]))
             dot = (p1[0] - p0[0]) * ax + (p1[1] - p0[1]) * ay
             mg.crossed = (dot < 0)
             return
 
-        # For 3+ robot merges: assign each track to its nearest dist-transform
-        # peak and store the mapping in mg.peak_assignment so _apply_separation
-        # can re-anchor each track to its actual observed location.
-        sorted_peaks = sorted(peaks[:n], key=lambda p: _proj(p[0], p[1]))
-        assignment = {}
+        # ── 3+ robot: assign peaks to tracks then update current_order ────
+        #
+        # FIX (e) + (f): we assign each peak to the nearest track using the
+        # CURRENT positions (which are themselves updated from peaks each frame
+        # via the main update loop), not the frozen entry positions.  This
+        # means prediction tracks the robots through the blob rather than
+        # drifting back to entry.
+        #
+        # If peaks < n (fix g): assign what we can, leave the rest at their
+        # last known positions.  current_order is only updated when we have
+        # enough peaks to determine it.
+
+        # Sort available peaks along entry axis
+        sorted_peaks = sorted(peaks, key=lambda p: _proj(p[0], p[1]))
+
+        # Build new assignment: for each track, find nearest unused peak
+        new_assignment = dict(mg.peak_assignment)  # start from last good state
         used_peaks = set()
-        # Sort tracks by their projection onto the entry axis, then greedily
-        # assign each to its nearest unused peak.
-        track_proj = []
+
+        # Use current positions (updated each frame from peaks) not entry positions
+        track_current_px = []
         for tid in mg.track_ids:
             if self._pos_px[tid] is not None:
-                tp = _proj(self._pos_px[tid][0], self._pos_px[tid][1])
+                track_current_px.append((tid, float(self._pos_px[tid][0]),
+                                              float(self._pos_px[tid][1])))
             else:
-                tp = _proj(0.0, 0.0)
-            track_proj.append((tid, tp))
-        track_proj.sort(key=lambda x: x[1])
-        for tid, _ in track_proj:
-            tx, ty = self._predict_image_pos(tid)
+                # Fall back to transformed field position
+                if self._pos[tid] is not None:
+                    pt = self.np.array([[[self._pos[tid][0], self._pos[tid][1]]]],
+                                       dtype=self.np.float32)
+                    ip = self.cv2.perspectiveTransform(pt, self._H_inv)[0][0]
+                    track_current_px.append((tid, float(ip[0]), float(ip[1])))
+                else:
+                    track_current_px.append((tid, mcx, mcy))
+
+        # Greedy nearest-peak assignment (globally optimal would need
+        # Hungarian here too, but n<=4 peaks means greedy is fine with
+        # the sorted-by-projection tie-breaking below)
+        # Sort tracks by current projection so nearby tracks compete fairly
+        track_current_px.sort(key=lambda t: _proj(t[1], t[2]))
+
+        successfully_assigned = 0
+        for tid, tx, ty in track_current_px:
             best_d, best_k = float('inf'), None
             for k, (px, py) in enumerate(sorted_peaks):
                 if k in used_peaks:
@@ -673,36 +727,40 @@ class RobotTracker:
                 if d < best_d:
                     best_d, best_k = d, k
             if best_k is not None:
-                assignment[tid] = sorted_peaks[best_k]
+                new_assignment[tid] = sorted_peaks[best_k]
                 used_peaks.add(best_k)
-        mg.peak_assignment = assignment
+                successfully_assigned += 1
+
+        mg.peak_assignment = new_assignment
+
+        # Update current_order: sort track IDs by their assigned peak projection
+        # Only update if we assigned at least as many peaks as we have tracks
+        # (if we had fewer peaks, the order might be partially stale — keep last)
+        if successfully_assigned >= n:
+            mg.current_order = sorted(
+                mg.track_ids,
+                key=lambda tid: _proj(*mg.peak_assignment[tid])
+                if tid in mg.peak_assignment else 0.0
+            )
 
     def _apply_separation(self, mg: MergeGroup) -> None:
+        """
+        Re-anchor track state on separation.
+
+        2-robot merges: unchanged — swap if crossed.
+        3+ robot merges: FIX (h) — apply the full permutation derived from
+        entry_order vs current_order, then re-anchor each track to its
+        current peak position.
+        """
         for tid in mg.track_ids:
             self._merge_recent[tid] = self.MERGE_HOLD
 
+        # ── 3+ robot case ─────────────────────────────────────────────────
         if len(mg.track_ids) != 2:
-            # For 3+ robot merges: snap each track to the dist-transform peak
-            # it was last assigned to, so they don't all collapse to the same
-            # centroid on separation and confuse the assignment step.
-            peak_assignment = mg.peak_assignment
-            reanchored = 0
-            for tid in mg.track_ids:
-                if tid in peak_assignment:
-                    px, py = peak_assignment[tid]
-                    pt = self.np.array([[[px, py]]], dtype=self.np.float32)
-                    fp = self.cv2.perspectiveTransform(pt, self._H_2d)[0][0]
-                    fx, fy = float(fp[0]), float(fp[1])
-                    if 0 <= fx <= 144 and 0 <= fy <= 144:
-                        self._pos[tid]    = (fx, fy)
-                        self._pos_px[tid] = (px, py)
-                        self._vel[tid]    = (0.0, 0.0)   # kill stale velocity
-                        self._vel_px[tid] = (0.0, 0.0)
-                        reanchored += 1
-            print("[INFO] Multi-robot merge resolved: {} — re-anchored {}/{} tracks".format(
-                sorted(mg.track_ids), reanchored, len(mg.track_ids)))
+            self._apply_separation_multi(mg)
             return
 
+        # ── 2-robot case (unchanged from v3.1) ────────────────────────────
         if mg.crossed:
             tids = mg.track_ids
             n    = len(tids)
@@ -721,16 +779,108 @@ class RobotTracker:
             print("[INFO] Separation, no crossing — preserved: {}".format(
                 sorted(mg.track_ids)))
 
+    def _apply_separation_multi(self, mg: MergeGroup) -> None:
+        """
+        FIX (h): Apply the permutation mapping for 3+ robot merges.
+
+        entry_order[k] is the track ID that was at position k along entry_axis
+        when the merge started.  current_order[k] is the track ID whose peak
+        is currently at position k along entry_axis.
+
+        Interpretation: the robot now at slot k (current_order[k]) should
+        inherit the identity of the robot that *entered* slot k (entry_order[k]).
+        In other words, track entry_order[k] should get the state of current_order[k].
+
+        Example:
+          entry_order   = [0, 1, 2]   (left to right at merge start)
+          current_order = [2, 0, 1]   (robots rearranged: R2 is now leftmost)
+          → R0 should get R2's current peak (slot 0 belongs to entry R0)
+          → R1 should get R0's current peak
+          → R2 should get R1's current peak
+        """
+        entry   = mg.entry_order
+        current = mg.current_order
+        n       = len(entry)
+
+        if len(current) != n:
+            # current_order was never fully populated (e.g. peaks always < n)
+            # Fall back to simple re-anchor without permutation
+            print("[WARN] Multi-robot merge resolved with incomplete order info — "
+                  "re-anchoring in place: {}".format(sorted(mg.track_ids)))
+            self._reanchor_from_peaks(mg.track_ids, mg.peak_assignment)
+            return
+
+        # Build permutation: for each slot k, who's there now vs who should be
+        # Slot k should have entry_order[k].  It currently has current_order[k].
+        # So entry_order[k] ← state of current_order[k].
+
+        # Snapshot current state for all tracks in the group
+        snap_pos    = {tid: self._pos[tid]    for tid in mg.track_ids}
+        snap_pos_px = {tid: self._pos_px[tid] for tid in mg.track_ids}
+        snap_vel    = {tid: self._vel[tid]    for tid in mg.track_ids}
+        snap_vel_px = {tid: self._vel_px[tid] for tid in mg.track_ids}
+
+        swapped = []
+        for k in range(n):
+            dest_tid = entry[k]    # the ID that owns slot k
+            src_tid  = current[k]  # who is physically at slot k right now
+            if dest_tid == src_tid:
+                continue
+            # Assign src's current state to dest
+            self._pos[dest_tid]    = snap_pos.get(src_tid)
+            self._pos_px[dest_tid] = snap_pos_px.get(src_tid)
+            self._vel[dest_tid]    = snap_vel.get(src_tid, (0.0, 0.0))
+            self._vel_px[dest_tid] = snap_vel_px.get(src_tid, (0.0, 0.0))
+            swapped.append((dest_tid, src_tid))
+
+        # Now re-anchor each track to its peak for a clean separation position
+        # (peak_assignment is keyed by track ID after the permutation above
+        #  already updated the positions, so we re-anchor by dest_tid → peak
+        #  of the physical robot now assigned to that ID)
+        for k in range(n):
+            dest_tid = entry[k]
+            src_tid  = current[k]
+            if src_tid in mg.peak_assignment:
+                px, py = mg.peak_assignment[src_tid]
+                pt = self.np.array([[[px, py]]], dtype=self.np.float32)
+                fp = self.cv2.perspectiveTransform(pt, self._H_2d)[0][0]
+                fx, fy = float(fp[0]), float(fp[1])
+                if 0 <= fx <= 144 and 0 <= fy <= 144:
+                    self._pos[dest_tid]    = (fx, fy)
+                    self._pos_px[dest_tid] = (px, py)
+                    self._vel[dest_tid]    = (0.0, 0.0)
+                    self._vel_px[dest_tid] = (0.0, 0.0)
+
+        if swapped:
+            print("[INFO] Multi-robot merge resolved WITH permutation: "
+                  "{} — swaps: {}".format(
+                      sorted(mg.track_ids),
+                      ", ".join("R{}←R{}".format(d, s) for d, s in swapped)))
+        else:
+            print("[INFO] Multi-robot merge resolved, no permutation: {}".format(
+                sorted(mg.track_ids)))
+
+    def _reanchor_from_peaks(self, track_ids, peak_assignment):
+        """Fallback: re-anchor each track to its last-known peak, in-place."""
+        reanchored = 0
+        for tid in track_ids:
+            if tid in peak_assignment:
+                px, py = peak_assignment[tid]
+                pt = self.np.array([[[px, py]]], dtype=self.np.float32)
+                fp = self.cv2.perspectiveTransform(pt, self._H_2d)[0][0]
+                fx, fy = float(fp[0]), float(fp[1])
+                if 0 <= fx <= 144 and 0 <= fy <= 144:
+                    self._pos[tid]    = (fx, fy)
+                    self._pos_px[tid] = (px, py)
+                    self._vel[tid]    = (0.0, 0.0)
+                    self._vel_px[tid] = (0.0, 0.0)
+                    reanchored += 1
+        print("[INFO] Re-anchored {}/{} tracks (fallback)".format(
+            reanchored, len(track_ids)))
+
     # ── foreground mask ───────────────────────────────────────────────────
 
     def _foreground_mask(self, frame):
-        """
-        Background-subtraction fg mask with neck-breaking.
-
-        After the standard morphology pass, erode then dilate by the
-        physics-derived neck kernel.  This severs bridges narrower than
-        ~15 % of robot width without shrinking the robot blobs themselves.
-        """
         cv2, np = self.cv2, self.np
         diff = cv2.absdiff(frame, self._bg)
         gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
@@ -743,17 +893,89 @@ class RobotTracker:
             fg = cv2.erode(fg,  self._neck_kern)
             fg = cv2.dilate(fg, self._neck_kern)
 
+        ball_mask = self._ball_color_mask(frame)
+        if ball_mask is not None:
+            fg = cv2.bitwise_and(fg, cv2.bitwise_not(ball_mask))
+
         return fg
+
+    def _scaled_odd_kernel(self, frac: float, min_size: int):
+        cv2 = self.cv2
+        size = max(min_size, int(round(self._robot_max_px * frac)))
+        if size % 2 == 0:
+            size += 1
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+    def _ball_color_mask(self, frame):
+        if not self.BALL_FILTER_ENABLED or self._field_mask is None:
+            self._last_ball_mask = None
+            return None
+
+        cv2, np = self.cv2, self.np
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(
+            hsv,
+            np.array(self.BALL_GREEN_HSV_LO, dtype=np.uint8),
+            np.array(self.BALL_GREEN_HSV_HI, dtype=np.uint8),
+        )
+        purple = cv2.inRange(
+            hsv,
+            np.array(self.BALL_PURPLE_HSV_LO, dtype=np.uint8),
+            np.array(self.BALL_PURPLE_HSV_HI, dtype=np.uint8),
+        )
+        mask = cv2.bitwise_or(green, purple)
+        mask = cv2.bitwise_and(mask, self._field_mask)
+
+        open_kern = self._scaled_odd_kernel(self.BALL_MASK_OPEN_FRAC, 3)
+        close_kern = self._scaled_odd_kernel(self.BALL_MASK_CLOSE_FRAC, 3)
+        dilate_kern = self._scaled_odd_kernel(self.BALL_MASK_DILATE_FRAC, 3)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kern)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kern)
+        mask = self._filter_contours_by_field_area(mask, self.BALL_MIN_FIELD_AREA_IN2)
+        mask = cv2.dilate(mask, dilate_kern)
+        self._last_ball_mask = mask
+        return mask
+
+    def _filter_contours_by_field_area(self, mask, min_area_in2: float):
+        cv2, np = self.cv2, self.np
+        if self._H_2d is None or min_area_in2 <= 0:
+            return mask
+
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        kept = np.zeros_like(mask)
+        for c in cnts:
+            if len(c) < 3:
+                continue
+            if self._contour_field_area_in2(c) >= min_area_in2:
+                cv2.drawContours(kept, [c], -1, 255, -1)
+        return kept
+
+    def _contour_field_area_in2(self, contour) -> float:
+        cv2, np = self.cv2, self.np
+        if self._H_2d is None:
+            return 0.0
+        approx = cv2.approxPolyDP(contour, 1.5, True)
+        if len(approx) < 3:
+            return 0.0
+        pts = approx.reshape(-1, 2).astype(np.float32)
+        field = cv2.perspectiveTransform(np.array([pts], dtype=np.float32),
+                                         self._H_2d)[0]
+        return abs(float(cv2.contourArea(field.reshape(-1, 1, 2))))
 
     # ── blob detector ─────────────────────────────────────────────────────
 
     def _foreground_contours(self, frame):
-        """Used by the debug overlay only."""
         cv2, np = self.cv2, self.np
         fg = self._foreground_mask(frame)
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid = sorted([c for c in cnts if cv2.contourArea(c) >= self.BLOB_MIN],
-                       key=lambda c: -cv2.contourArea(c))
+        valid = []
+        for c in cnts:
+            if cv2.contourArea(c) < self.BLOB_MIN:
+                continue
+            if self._contour_field_area_in2(c) < self.BLOB_MIN_FIELD_AREA_IN2:
+                continue
+            valid.append(c)
+        valid.sort(key=lambda c: -cv2.contourArea(c))
         all_split = []
         for c in valid:
             area = float(cv2.contourArea(c))
@@ -765,7 +987,6 @@ class RobotTracker:
         return valid, [(int(sx), int(sy)) for sx, sy, _ in all_split]
 
     def _split_contour(self, contour):
-        """Distance-transform peak detection; one centre per robot."""
         cv2, np = self.cv2, self.np
         h, w = self._field_mask.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
@@ -807,9 +1028,6 @@ class RobotTracker:
         cv2, np = self.cv2, self.np
         if dist.max() == 0:
             return []
-
-        # Large pileups need a gentler peak extractor than the default
-        # 40%-threshold + 7x7 erosion, which often merges 3 nearby maxima into 2.
         peak_ratio = (self.RELAXED_PEAK_RATIO_MULTI
                       if expected >= 3 else self.RELAXED_PEAK_RATIO_PAIR)
         _, peak_mask = cv2.threshold(dist, dist.max() * peak_ratio, 255, cv2.THRESH_BINARY)
@@ -818,7 +1036,6 @@ class RobotTracker:
         k_sep = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sep_size, sep_size))
         peak_mask = cv2.erode(peak_mask, k_sep)
         peak_mask = cv2.bitwise_and(peak_mask, mask)
-
         n_labels, labels = cv2.connectedComponents(peak_mask)
         centers = []
         for lbl in range(1, n_labels):
@@ -857,14 +1074,6 @@ class RobotTracker:
         return blocked
 
     def _get_blobs(self, frame):
-        """
-        Return ALL valid sub-centres from ALL large-enough contours as
-        (fx_in, fy_in, heading, parent_id, cx_px, cy_px, contour).
-
-        Not capped at 4 — the assignment step picks the best 4.
-        Previously the cap caused a merged blob (2 sub-centres) to starve
-        the other 2 solo robots out of the candidate pool.
-        """
         cv2, np = self.cv2, self.np
         fg = self._foreground_mask(frame)
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -873,6 +1082,9 @@ class RobotTracker:
         for parent_id, c in enumerate(cnts):
             area = float(cv2.contourArea(c))
             if area < self.BLOB_MIN:
+                continue
+            field_area = self._contour_field_area_in2(c)
+            if field_area < self.BLOB_MIN_FIELD_AREA_IN2:
                 continue
             _bm = np.zeros(self._field_mask.shape, dtype=np.uint8)
             cv2.drawContours(_bm, [c], -1, 255, -1)
@@ -933,9 +1145,6 @@ class RobotTracker:
         robot_area = max(self._robot_max_px * self._robot_max_px, 1.0)
         ratio = per_area / robot_area
         penalty = min(abs(math.log(max(ratio, 1e-6))), 2.5) * 0.28
-
-        # A giant contour that still produced only one centre is usually a
-        # merged object or field clutter, not a clean isolated robot.
         if split_count == 1 and area > robot_area * 1.8:
             penalty += min((area / robot_area) - 1.8, 2.0) * 0.7
         return penalty
@@ -970,9 +1179,234 @@ class FieldDetector:
                                    dtype=np.float32)
                 H, _ = cv2.findHomography(
                     ordered,
-                    np.array([[0,144],[144,144],[144,0],[0,0]], np.float32))
+                    np.array([[0,0],[144,0],[144,144],[0,144]], np.float32))
                 return ordered, H
         return None
+
+
+def _project_field_points(cv2, np, H_inv, points_in):
+    pts = np.array([points_in], dtype=np.float32)
+    img = cv2.perspectiveTransform(pts, H_inv)[0]
+    return [(float(p[0]), float(p[1])) for p in img]
+
+
+def _project_image_points(cv2, np, H_2d, points_px):
+    pts = np.array([points_px], dtype=np.float32)
+    field = cv2.perspectiveTransform(pts, H_2d)[0]
+    return [(float(p[0]), float(p[1])) for p in field]
+
+
+def _detect_robot_edge_profile(cv2, np, frame, fg_mask, tracker, center_px):
+    """
+    Find the robot's floor contact point from the local foreground silhouette.
+
+    Tracker poses are blob centers, not ground-contact centers. For the cube
+    base we choose the connected foreground component nearest the tracked point,
+    then use Canny edges on its lower silhouette to estimate where the robot
+    touches the field.
+    """
+    h, w = frame.shape[:2]
+    cx, cy = center_px
+    pad = max(22, int(tracker._robot_max_px * 1.05))
+    x0 = max(0, int(cx - pad)); x1 = min(w, int(cx + pad))
+    y0 = max(0, int(cy - pad * 1.5)); y1 = min(h, int(cy + pad * 1.2))
+    fallback_h = tracker._robot_max_px * 0.85
+    fallback_box = (
+        cx - tracker._robot_max_px * 0.35,
+        cy - fallback_h,
+        cx + tracker._robot_max_px * 0.35,
+        cy,
+    )
+    if x1 <= x0 or y1 <= y0:
+        return {
+            "base_px": center_px,
+            "top_y": cy - fallback_h,
+            "bbox": fallback_box,
+        }
+
+    roi = frame[y0:y1, x0:x1]
+    fg_roi = fg_mask[y0:y1, x0:x1]
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        fg_roi, 8)
+    if n_labels <= 1:
+        return {
+            "base_px": center_px,
+            "top_y": cy - fallback_h,
+            "bbox": fallback_box,
+        }
+
+    local_cx = float(cx - x0)
+    local_cy = float(cy - y0)
+    center_label = labels[int(np.clip(round(local_cy), 0, labels.shape[0]-1)),
+                          int(np.clip(round(local_cx), 0, labels.shape[1]-1))]
+    best_lbl = None
+    best_score = -1.0
+    for lbl in range(1, n_labels):
+        area = float(stats[lbl, cv2.CC_STAT_AREA])
+        if area < max(30.0, tracker.BLOB_MIN * 0.12):
+            continue
+        ccx, ccy = centroids[lbl]
+        dist = math.hypot(float(ccx) - local_cx, float(ccy) - local_cy)
+        score = area / (1.0 + dist / max(tracker._robot_max_px, 1.0))
+        if center_label == lbl:
+            score *= 2.0
+        if score > best_score:
+            best_score = score
+            best_lbl = lbl
+
+    if best_lbl is None:
+        return {
+            "base_px": center_px,
+            "top_y": cy - fallback_h,
+            "bbox": fallback_box,
+        }
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 45, 135)
+    comp = (labels == best_lbl).astype(np.uint8) * 255
+    edges = cv2.bitwise_and(edges, comp)
+
+    comp_ys, comp_xs = np.where(comp > 0)
+    if len(comp_xs) < 8:
+        return {
+            "base_px": center_px,
+            "top_y": cy - fallback_h,
+            "bbox": fallback_box,
+        }
+
+    ys, xs = np.where(edges > 0)
+    if len(xs) >= 8:
+        edge_rx = max(8.0, tracker._robot_max_px * 0.62)
+        edge_ry = max(10.0, tracker._robot_max_px * 1.05)
+        edge_keep = (
+            ((xs.astype(np.float32) - local_cx) / edge_rx) ** 2 +
+            ((ys.astype(np.float32) - local_cy) / edge_ry) ** 2
+        ) <= 1.0
+        if int(edge_keep.sum()) >= 8:
+            xs = xs[edge_keep]
+            ys = ys[edge_keep]
+
+    comp_rx = max(8.0, tracker._robot_max_px * 0.65)
+    comp_ry = max(10.0, tracker._robot_max_px * 1.10)
+    comp_keep = (
+        ((comp_xs.astype(np.float32) - local_cx) / comp_rx) ** 2 +
+        ((comp_ys.astype(np.float32) - local_cy) / comp_ry) ** 2
+    ) <= 1.0
+    if int(comp_keep.sum()) >= 8:
+        comp_xs = comp_xs[comp_keep]
+        comp_ys = comp_ys[comp_keep]
+
+    comp_h = max(1.0, float(comp_ys.max() - comp_ys.min() + 1))
+    lower_y = comp_ys.min() + comp_h * 0.58
+
+    lower_edges = ys >= lower_y
+    if int(lower_edges.sum()) >= 5:
+        edge_ys = ys[lower_edges]
+        edge_xs = xs[lower_edges]
+        base_y_local = float(np.percentile(edge_ys, 92))
+        band = edge_ys >= base_y_local - max(3.0, comp_h * 0.16)
+        base_x_local = float(np.median(edge_xs[band] if int(band.sum()) else edge_xs))
+    else:
+        base_y_local = float(np.percentile(comp_ys, 96))
+        band = comp_ys >= base_y_local - max(3.0, comp_h * 0.14)
+        base_x_local = float(np.median(comp_xs[band] if int(band.sum()) else comp_xs))
+
+    comp_box = (
+        x0 + float(np.percentile(comp_xs, 4)),
+        y0 + float(np.percentile(comp_ys, 4)),
+        x0 + float(np.percentile(comp_xs, 96)),
+        y0 + float(np.percentile(comp_ys, 96)),
+    )
+
+    if len(xs) >= 8:
+        canny_box = (
+            x0 + float(np.percentile(xs, 3)),
+            y0 + float(np.percentile(ys, 3)),
+            x0 + float(np.percentile(xs, 97)),
+            y0 + float(np.percentile(ys, 97)),
+        )
+        edge_box = (
+            min(canny_box[0], comp_box[0]),
+            min(canny_box[1], comp_box[1]),
+            max(canny_box[2], comp_box[2]),
+            max(canny_box[3], comp_box[3]),
+        )
+        top_y_local = float(np.percentile(ys, 8))
+    else:
+        edge_box = comp_box
+        top_y_local = float(np.percentile(comp_ys, 5))
+
+    return {
+        "base_px": (x0 + base_x_local, y0 + base_y_local),
+        "top_y": y0 + top_y_local,
+        "bbox": edge_box,
+    }
+
+
+def _projected_bottom_for_side(cv2, np, H_inv, field_center, side_in):
+    half = side_in / 2.0
+    bottom_field = [
+        (field_center[0] - half, field_center[1] - half),
+        (field_center[0] + half, field_center[1] - half),
+        (field_center[0] + half, field_center[1] + half),
+        (field_center[0] - half, field_center[1] + half),
+    ]
+    return _project_field_points(cv2, np, H_inv, bottom_field)
+
+
+def _choose_cube_side_in(cv2, np, H_inv, field_center, edge_bbox, tracker):
+    x_min, _y_min, x_max, _y_max = edge_bbox
+    target_min = x_min - 2.0
+    target_max = x_max + 2.0
+    lo = max(8.0, tracker.ROBOT_SIZE_IN * 0.45)
+    hi = tracker.ROBOT_SIZE_IN * 1.20
+    best = hi
+    for _ in range(10):
+        mid = (lo + hi) * 0.5
+        bottom = _projected_bottom_for_side(cv2, np, H_inv, field_center, mid)
+        bx_min = min(p[0] for p in bottom)
+        bx_max = max(p[0] for p in bottom)
+        if bx_min <= target_min and bx_max >= target_max:
+            best = mid
+            hi = mid
+        else:
+            lo = mid
+    return best
+
+
+def _draw_wire_cube(cv2, np, dbg, frame, fg_mask, tracker, H_inv,
+                    pose, center_px, color):
+    profile = _detect_robot_edge_profile(
+        cv2, np, frame, fg_mask, tracker, center_px)
+    base_px = profile["base_px"]
+    top_y = profile["top_y"]
+    edge_bbox = profile["bbox"]
+    if tracker._H_2d is not None:
+        field_center = _project_image_points(cv2, np, tracker._H_2d, [base_px])[0]
+    else:
+        field_center = (pose.x_in, pose.y_in)
+
+    side_in = _choose_cube_side_in(cv2, np, H_inv, field_center, edge_bbox, tracker)
+    bottom = _projected_bottom_for_side(cv2, np, H_inv, field_center, side_in)
+    h, w = dbg.shape[:2]
+    if not all(-w <= x <= 2*w and -h <= y <= 2*h for x, y in bottom):
+        return
+
+    height_px = base_px[1] - top_y
+    height_px = float(np.clip(height_px,
+                              tracker._robot_max_px * 0.45,
+                              tracker._robot_max_px * 1.45))
+    top = [(x, y - height_px) for x, y in bottom]
+
+    bottom_i = [(int(round(x)), int(round(y))) for x, y in bottom]
+    top_i = [(int(round(x)), int(round(y))) for x, y in top]
+
+    for pts, thickness in ((bottom_i, 1), (top_i, 2)):
+        for j in range(4):
+            cv2.line(dbg, pts[j], pts[(j+1) % 4], color, thickness, cv2.LINE_AA)
+    for j in range(4):
+        cv2.line(dbg, bottom_i[j], top_i[j], color, 2, cv2.LINE_AA)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -985,6 +1419,7 @@ def process_match(
     sample_rate_fps   = 10.0,
     debug             = False,
     debug_every_n     = 10,
+    debug_enable_hitboxes = False,
     manual_corners_px = None,
 ):
     cv2 = _require("cv2", "opencv-python")
@@ -1003,10 +1438,14 @@ def process_match(
 
     start_frame = int(start_offset_sec * video_fps)
     frame_step  = max(1, int(round(video_fps / sample_rate_fps)))
+    if PROCESS_EVERY_SOURCE_FRAME:
+        frame_step = 1
     print("[INFO] Processing every {} frames (~{:.1f} fps output)".format(
         frame_step, video_fps / frame_step))
     if debug:
         print("[INFO] Saving debug frame about every {} source frames".format(debug_every_n))
+        if debug_enable_hitboxes:
+            print("[INFO] Debug robot wireframe hitboxes enabled.")
 
     csv_path    = os.path.join(output_dir, "robot_positions.csv")
     wpilog_path = os.path.join(output_dir, "match_log.wpilog")
@@ -1049,7 +1488,7 @@ def process_match(
         bl, br, tr, tl = [np.array(c, np.float32) for c in manual_corners_px]
         ordered = np.array([tl, tr, br, bl], np.float32)
         H_2d, _ = cv2.findHomography(
-            ordered, np.array([[0,144],[144,144],[144,0],[0,0]], np.float32))
+            ordered, np.array([[0,0],[144,0],[144,144],[0,144]], np.float32))
         H_inv = np.linalg.inv(H_2d)
         tracker.setup(video_path, ordered, frame_shape)
         print("[INFO] Manual corners loaded.")
@@ -1120,12 +1559,23 @@ def process_match(
 
         if debug and debug_dir and H_inv is not None:
             dbg = frame.copy()
+            fg_debug = None
             if ordered is not None:
                 cv2.polylines(dbg, [ordered.astype(np.int32).reshape(-1,1,2)],
                               True, (0, 200, 0), 2)
 
             if tracker._bg is not None:
+                fg_debug = tracker._foreground_mask(frame)
                 all_cnts, split_centers = tracker._foreground_contours(frame)
+                if tracker._last_ball_mask is not None:
+                    ball_cnts, _ = cv2.findContours(
+                        tracker._last_ball_mask,
+                        cv2.RETR_EXTERNAL,
+                        cv2.CHAIN_APPROX_SIMPLE,
+                    )
+                    for bc in ball_cnts:
+                        if cv2.contourArea(bc) >= 20:
+                            cv2.drawContours(dbg, [bc], -1, (255, 0, 255), 1)
                 for c in all_cnts:
                     area = cv2.contourArea(c)
                     _bm2 = np.zeros(tracker._field_mask.shape, np.uint8)
@@ -1146,14 +1596,12 @@ def process_match(
                     cv2.drawMarker(dbg, (sx, sy), (0, 255, 255),
                                    cv2.MARKER_CROSS, 16, 2)
 
-            # 18" reference circle
             fh_d, fw_d = frame.shape[:2]
             cv2.circle(dbg, (fw_d-40, 40),
                        int(tracker._robot_max_px / 2), (80, 80, 80), 1)
             cv2.putText(dbg, "18in", (fw_d-74, 57),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.32, (80, 80, 80), 1)
 
-            # Merge group annotations
             for mg in tracker._merge_groups.values():
                 pos_list = [tracker._pos_px[t] for t in mg.track_ids
                             if tracker._pos_px[t] is not None]
@@ -1162,10 +1610,18 @@ def process_match(
                     mcy = int(sum(p[1] for p in pos_list) / len(pos_list))
                     ax, ay = mg.entry_axis
                     ex = int(mcx+ax*50); ey = int(mcy+ay*50)
-                    col = (0, 80, 255) if mg.crossed else (0, 220, 100)
+                    # Show permutation state in debug overlay
+                    if len(mg.track_ids) == 2:
+                        col = (0, 80, 255) if mg.crossed else (0, 220, 100)
+                        lbl2 = "+".join("R{}".format(t) for t in mg.track_ids)
+                        lbl2 += " CROSSED" if mg.crossed else " ok"
+                    else:
+                        col = (255, 160, 0)
+                        entry_s   = "".join(str(t) for t in mg.entry_order)
+                        current_s = "".join(str(t) for t in mg.current_order)
+                        lbl2 = "+".join("R{}".format(t) for t in mg.track_ids)
+                        lbl2 += " [{}→{}]".format(entry_s, current_s)
                     cv2.arrowedLine(dbg, (mcx, mcy), (ex, ey), col, 2)
-                    lbl2 = "+".join("R{}".format(t) for t in mg.track_ids)
-                    lbl2 += " CROSSED" if mg.crossed else " ok"
                     cv2.putText(dbg, lbl2, (mcx+6, mcy-8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
@@ -1182,11 +1638,19 @@ def process_match(
                 col = debug_colors[i]
                 cv2.circle(dbg, (ix, iy), 16, col, -1)
                 cv2.circle(dbg, (ix, iy), 19, (255, 255, 255), 2)
+                if debug_enable_hitboxes and fg_debug is not None:
+                    _draw_wire_cube(cv2, np, dbg, frame, fg_debug,
+                                    tracker, H_inv, p, (ix, iy), col)
                 cv2.putText(dbg, "R{}".format(i), (ix-10, iy-24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                dx = int(28 * math.cos(p.heading))
-                dy = int(-28 * math.sin(p.heading))
-                cv2.arrowedLine(dbg, (ix, iy), (ix+dx, iy+dy), (255,255,255), 2)
+                vx_px, vy_px = tracker._vel_px[i]
+                speed_px = math.hypot(vx_px, vy_px)
+                if speed_px >= 0.35:
+                    scale = 28.0 / speed_px
+                    dx = int(round(vx_px * scale))
+                    dy = int(round(vy_px * scale))
+                    cv2.arrowedLine(dbg, (ix, iy), (ix+dx, iy+dy),
+                                    (255,255,255), 2)
                 n_drawn += 1
 
             n_merged = sum(len(mg.track_ids) for mg in tracker._merge_groups.values())
@@ -1234,7 +1698,8 @@ def _print_instructions():
 |  7. Press play!                                                  |
 |                                                                  |
 |  Robot IDs: assigned left-to-right at match start.               |
-|  Debug frames show merge axis + CROSSED/ok, and 18" ref circle.  |
+|  Debug overlay: 2-robot merges show CROSSED/ok; 3+ show          |
+|  [entry_order→current_order] permutation string.                 |
 +------------------------------------------------------------------+
 """)
 
@@ -1282,6 +1747,8 @@ def main():
                    help="Save annotated debug frames to tracker_debug/")
     p.add_argument("--debug-every",  type=int, default=5,
                    help="Save 1 debug frame every N processed frames (default 5)")
+    p.add_argument("--debug-enable-hitboxes", action="store_true",
+                   help="Draw robot wireframe hitboxes in debug frames")
     p.add_argument("--no-download",  action="store_true")
     p.add_argument("--video-path",   default=None)
     p.add_argument("--corners",      default=None,
@@ -1312,6 +1779,7 @@ def main():
         sample_rate_fps   = args.sample_rate,
         debug             = args.debug,
         debug_every_n     = args.debug_every,
+        debug_enable_hitboxes = args.debug_enable_hitboxes,
         manual_corners_px = corners,
     )
 

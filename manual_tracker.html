@@ -1,0 +1,1392 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manual Robot Tracker</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080808;
+      --panel: #131114;
+      --panel-2: #1a1712;
+      --line: #352a1f;
+      --muted: #ababab;
+      --text: #e2e2e2;
+      --accent: #fe8f00;
+      --accent-2: #ff9626;
+      --danger: #d95f45;
+      --r0: #49b6ff;
+      --r1: #ff9626;
+      --r2: #ff735d;
+      --r3: #56d58a;
+      font-family: Poppins, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      min-height: 34px;
+      padding: 0 10px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: #6f4c1c;
+      background: #241b10;
+    }
+
+    button.primary {
+      background: #fe8f00;
+      border-color: #ffb24d;
+      color: #080808;
+      font-weight: 800;
+    }
+
+    button.danger {
+      background: #471e16;
+      border-color: #7a3829;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.2;
+    }
+
+    input,
+    select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0f0f0f;
+      color: var(--text);
+      min-height: 34px;
+      padding: 6px 8px;
+    }
+
+    input[type="file"] {
+      padding: 5px 8px;
+    }
+
+    input[type="range"] {
+      padding: 0;
+      accent-color: var(--accent);
+    }
+
+    .app {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      height: 100vh;
+      min-height: 0;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(170px, auto) minmax(180px, 1.2fr) minmax(180px, 1fr) minmax(180px, 1fr) auto auto auto;
+      gap: 10px;
+      align-items: end;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(8, 8, 8, 0.9);
+      backdrop-filter: blur(5px);
+    }
+
+    .brand {
+      display: grid;
+      grid-template-columns: 112px minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      min-width: 0;
+      align-self: center;
+    }
+
+    .brand-logo {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .brand-logo img {
+      display: block;
+      width: 112px;
+      max-height: 40px;
+      object-fit: contain;
+    }
+
+    .brand-name {
+      font-size: 15px;
+      font-weight: 800;
+      line-height: 1.05;
+      color: var(--accent-2);
+      white-space: nowrap;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .brand-subtitle {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.1;
+      white-space: nowrap;
+    }
+
+    .field {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .stage-shell {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: 1fr auto;
+      background: #050505;
+    }
+
+    .stage {
+      position: relative;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    video,
+    canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    video {
+      object-fit: contain;
+      background: #050505;
+    }
+
+    canvas {
+      pointer-events: auto;
+    }
+
+    .empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: #777a7e;
+      font-size: 15px;
+      letter-spacing: 0;
+      pointer-events: none;
+    }
+
+    .transport {
+      display: grid;
+      grid-template-columns: auto auto 1fr auto auto auto;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      background: #0f0f0f;
+    }
+
+    .timebox {
+      min-width: 104px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+
+    .side {
+      min-height: 0;
+      overflow: auto;
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px;
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+
+    .section {
+      display: grid;
+      gap: 10px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .section-title {
+      color: #e2e2e2;
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .robot-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .robot-button {
+      min-width: 0;
+      padding: 0;
+      font-weight: 700;
+      border-width: 2px;
+    }
+
+    .robot-button[data-active="true"] {
+      background: #eef3f7;
+      color: #080808;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .row3 {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+
+    .inline {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .inline input[type="checkbox"] {
+      width: 18px;
+      min-height: 18px;
+      accent-color: var(--accent);
+    }
+
+    .toggle {
+      justify-content: space-between;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #0f0f0f;
+    }
+
+    .track-list {
+      display: grid;
+      gap: 6px;
+      max-height: 280px;
+      overflow: auto;
+    }
+
+    .track-row {
+      display: grid;
+      grid-template-columns: 58px 1fr auto;
+      gap: 8px;
+      align-items: center;
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0f0f0f;
+      font-size: 13px;
+    }
+
+    .track-row strong {
+      font-variant-numeric: tabular-nums;
+    }
+
+    .track-row span {
+      color: var(--muted);
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 48px;
+      min-height: 26px;
+      border-radius: 999px;
+      background: #080808;
+      color: var(--muted);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      border: 1px solid var(--line);
+    }
+
+    .status {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 920px) {
+      .topbar {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .brand {
+        grid-column: 1 / -1;
+      }
+
+      .workspace {
+        grid-template-columns: 1fr;
+        overflow: auto;
+      }
+
+      .side {
+        border-left: 0;
+        border-top: 1px solid var(--line);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand" aria-label="Juice 16236 Manual Tracker">
+        <div class="brand-logo">
+          <img src="https://juicerobotics.org/assets/dark/logo.png" alt="Juice 16236 Logo">
+        </div>
+        <div>
+          <div class="brand-name">AutoScout</div>
+          <div class="brand-subtitle">Manual Robot Tracker</div>
+        </div>
+      </div>
+      <div class="field">
+        <label for="videoFile">Video</label>
+        <input id="videoFile" type="file" accept="video/*">
+      </div>
+      <div class="field">
+        <label for="cornersFile">Field corners</label>
+        <input id="cornersFile" type="file" accept="application/json,.json">
+      </div>
+      <div class="field">
+        <label for="sessionFile">Session</label>
+        <input id="sessionFile" type="file" accept="application/json,.json">
+      </div>
+      <button id="exportCsv" class="primary" title="Export robot_positions.csv">CSV</button>
+      <button id="exportJson" title="Export editable tracker session">JSON</button>
+      <button id="clearAll" class="danger" title="Clear all labels">Clear</button>
+    </header>
+
+    <main class="workspace">
+      <section class="stage-shell">
+        <div class="stage" id="stage">
+          <video id="video" playsinline></video>
+          <canvas id="overlay"></canvas>
+          <div id="empty" class="empty">Load a video</div>
+        </div>
+        <div class="transport">
+          <button id="playPause" title="Play or pause">Play</button>
+          <button id="prevFrame" title="Previous frame">&lt;</button>
+          <input id="scrub" type="range" min="0" max="0" step="0.001" value="0">
+          <button id="nextFrame" title="Next frame">&gt;</button>
+          <div id="timeReadout" class="timebox">0.000 / 0.000</div>
+          <select id="stepSize" title="Step size">
+            <option value="1">1 frame</option>
+            <option value="5">5 frames</option>
+            <option value="15">15 frames</option>
+            <option value="1s">1 sec</option>
+          </select>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="section">
+          <div class="section-title">Robot</div>
+          <div class="robot-grid" id="robotButtons"></div>
+          <div class="inline toggle">
+            <label for="visibleToggle">Visible</label>
+            <input id="visibleToggle" type="checkbox" checked>
+          </div>
+          <div class="row">
+            <button id="markCurrent" class="primary" title="Save the selected robot at the current video time">Mark</button>
+            <button id="deleteCurrent" title="Delete selected robot label near this time">Delete</button>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Pose</div>
+          <div class="row">
+            <div class="field">
+              <label for="xIn">X inches</label>
+              <input id="xIn" type="number" step="0.01" min="0" max="144">
+            </div>
+            <div class="field">
+              <label for="yIn">Y inches</label>
+              <input id="yIn" type="number" step="0.01" min="0" max="144">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="headingRad">Heading rad</label>
+              <input id="headingRad" type="number" step="0.001">
+            </div>
+            <div class="field">
+              <label for="headingDeg">Heading deg</label>
+              <input id="headingDeg" type="number" step="0.1">
+            </div>
+          </div>
+          <div class="row">
+            <button id="nudgeLeft" title="Nudge left">Left</button>
+            <button id="nudgeRight" title="Nudge right">Right</button>
+          </div>
+          <div class="row">
+            <button id="nudgeUp" title="Nudge up">Up</button>
+            <button id="nudgeDown" title="Nudge down">Down</button>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Export</div>
+          <div class="row3">
+            <div class="field">
+              <label for="sampleRate">FPS</label>
+              <input id="sampleRate" type="number" min="1" max="60" step="1" value="30">
+            </div>
+            <div class="field">
+              <label for="startOffset">Start</label>
+              <input id="startOffset" type="number" step="0.001" value="0">
+            </div>
+            <div class="field">
+              <label for="endTime">End</label>
+              <input id="endTime" type="number" step="0.001" value="0">
+            </div>
+          </div>
+          <div class="inline toggle">
+            <label for="interpolateToggle">Interpolate</label>
+            <input id="interpolateToggle" type="checkbox" checked>
+          </div>
+          <div class="status" id="status">No labels yet</div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Labels</div>
+          <div id="trackList" class="track-list"></div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script>
+    const ROBOT_COUNT = 4;
+    const FIELD_SIZE_IN = 144;
+    const COLORS = ["#49b6ff", "#ff9626", "#ff735d", "#56d58a"];
+    const state = {
+      selectedRobot: 0,
+      labels: Array.from({ length: ROBOT_COUNT }, () => []),
+      currentPose: null,
+      corners: null,
+      homography: null,
+      inverseHomography: null,
+      view: { scale: 1, offsetX: 0, offsetY: 0, width: 0, height: 0 },
+      fps: 30,
+      dragging: false
+    };
+
+    const els = {
+      videoFile: document.getElementById("videoFile"),
+      cornersFile: document.getElementById("cornersFile"),
+      sessionFile: document.getElementById("sessionFile"),
+      exportCsv: document.getElementById("exportCsv"),
+      exportJson: document.getElementById("exportJson"),
+      clearAll: document.getElementById("clearAll"),
+      video: document.getElementById("video"),
+      overlay: document.getElementById("overlay"),
+      empty: document.getElementById("empty"),
+      playPause: document.getElementById("playPause"),
+      prevFrame: document.getElementById("prevFrame"),
+      nextFrame: document.getElementById("nextFrame"),
+      scrub: document.getElementById("scrub"),
+      timeReadout: document.getElementById("timeReadout"),
+      stepSize: document.getElementById("stepSize"),
+      robotButtons: document.getElementById("robotButtons"),
+      visibleToggle: document.getElementById("visibleToggle"),
+      markCurrent: document.getElementById("markCurrent"),
+      deleteCurrent: document.getElementById("deleteCurrent"),
+      xIn: document.getElementById("xIn"),
+      yIn: document.getElementById("yIn"),
+      headingRad: document.getElementById("headingRad"),
+      headingDeg: document.getElementById("headingDeg"),
+      nudgeLeft: document.getElementById("nudgeLeft"),
+      nudgeRight: document.getElementById("nudgeRight"),
+      nudgeUp: document.getElementById("nudgeUp"),
+      nudgeDown: document.getElementById("nudgeDown"),
+      sampleRate: document.getElementById("sampleRate"),
+      startOffset: document.getElementById("startOffset"),
+      endTime: document.getElementById("endTime"),
+      interpolateToggle: document.getElementById("interpolateToggle"),
+      status: document.getElementById("status"),
+      trackList: document.getElementById("trackList")
+    };
+
+    for (let i = 0; i < ROBOT_COUNT; i += 1) {
+      const btn = document.createElement("button");
+      btn.className = "robot-button";
+      btn.textContent = `R${i}`;
+      btn.style.borderColor = COLORS[i];
+      btn.dataset.robot = String(i);
+      btn.addEventListener("click", () => selectRobot(i));
+      els.robotButtons.appendChild(btn);
+    }
+
+    selectRobot(0);
+    resizeCanvas();
+    requestAnimationFrame(drawLoop);
+
+    els.videoFile.addEventListener("change", () => {
+      const file = els.videoFile.files[0];
+      if (!file) return;
+      const url = URL.createObjectURL(file);
+      els.video.src = url;
+      els.video.load();
+      els.empty.style.display = "none";
+      setStatus(`Loaded ${file.name}`);
+    });
+
+    els.video.addEventListener("loadedmetadata", () => {
+      els.scrub.max = String(els.video.duration || 0);
+      els.endTime.value = formatTime(els.video.duration || 0);
+      state.fps = detectFpsFromName(els.videoFile.files[0]?.name) || 30;
+      els.sampleRate.value = String(Math.round(state.fps));
+      resizeCanvas();
+      refreshPoseFromTimeline();
+      renderTrackList();
+    });
+
+    els.video.addEventListener("timeupdate", () => {
+      if (!state.dragging) {
+        els.scrub.value = String(els.video.currentTime);
+      }
+      refreshPoseFromTimeline();
+      updateTimeReadout();
+    });
+
+    els.video.addEventListener("play", () => {
+      els.playPause.textContent = "Pause";
+    });
+
+    els.video.addEventListener("pause", () => {
+      els.playPause.textContent = "Play";
+    });
+
+    els.scrub.addEventListener("input", () => {
+      state.dragging = true;
+      els.video.currentTime = Number(els.scrub.value);
+      refreshPoseFromTimeline();
+      updateTimeReadout();
+    });
+
+    els.scrub.addEventListener("change", () => {
+      state.dragging = false;
+    });
+
+    els.playPause.addEventListener("click", () => {
+      if (!els.video.src) return;
+      if (els.video.paused) {
+        els.video.play();
+      } else {
+        els.video.pause();
+      }
+    });
+
+    els.prevFrame.addEventListener("click", () => stepVideo(-1));
+    els.nextFrame.addEventListener("click", () => stepVideo(1));
+    els.markCurrent.addEventListener("click", markCurrentPose);
+    els.deleteCurrent.addEventListener("click", deleteNearestLabel);
+    els.exportCsv.addEventListener("click", exportCsv);
+    els.exportJson.addEventListener("click", exportJson);
+
+    els.clearAll.addEventListener("click", () => {
+      if (!confirm("Clear all manual robot labels?")) return;
+      state.labels = Array.from({ length: ROBOT_COUNT }, () => []);
+      state.currentPose = null;
+      updatePoseInputs();
+      renderTrackList();
+      setStatus("Cleared labels");
+    });
+
+    els.cornersFile.addEventListener("change", async () => {
+      const file = els.cornersFile.files[0];
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        const corners = parseCorners(parsed);
+        setCorners(corners);
+        setStatus(`Loaded ${file.name}`);
+      } catch (err) {
+        alert(`Could not load corners: ${err.message}`);
+      }
+    });
+
+    els.sessionFile.addEventListener("change", async () => {
+      const file = els.sessionFile.files[0];
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        loadSession(parsed);
+        setStatus(`Loaded ${file.name}`);
+      } catch (err) {
+        alert(`Could not load session: ${err.message}`);
+      }
+    });
+
+    [els.xIn, els.yIn, els.headingRad].forEach((input) => {
+      input.addEventListener("change", syncPoseFromInputs);
+      input.addEventListener("input", syncPoseFromInputs);
+    });
+
+    els.headingDeg.addEventListener("change", () => {
+      const deg = Number(els.headingDeg.value);
+      if (!Number.isFinite(deg)) return;
+      ensurePose();
+      state.currentPose.heading = deg * Math.PI / 180;
+      updatePoseInputs();
+    });
+
+    els.headingDeg.addEventListener("input", () => {
+      const deg = Number(els.headingDeg.value);
+      if (!Number.isFinite(deg)) return;
+      ensurePose();
+      state.currentPose.heading = deg * Math.PI / 180;
+      els.headingRad.value = state.currentPose.heading.toFixed(4);
+    });
+
+    els.visibleToggle.addEventListener("change", () => {
+      ensurePose();
+      state.currentPose.visible = els.visibleToggle.checked;
+    });
+
+    els.overlay.addEventListener("click", (event) => {
+      if (!els.video.src) return;
+      if (!state.homography) {
+        alert("Load field_corners.json before click-labeling robots.");
+        return;
+      }
+      const pt = eventToVideoPoint(event);
+      if (!pt) return;
+      const field = imageToField(pt.x, pt.y);
+      ensurePose();
+      state.currentPose.xPx = pt.x;
+      state.currentPose.yPx = pt.y;
+      state.currentPose.xIn = field.x;
+      state.currentPose.yIn = field.y;
+      state.currentPose.visible = els.visibleToggle.checked;
+      markCurrentPose();
+    });
+
+    document.addEventListener("keydown", (event) => {
+      const tag = event.target.tagName.toLowerCase();
+      if (tag === "input" || tag === "select") return;
+      if (event.key >= "1" && event.key <= "4") {
+        selectRobot(Number(event.key) - 1);
+      } else if (event.key === " ") {
+        event.preventDefault();
+        els.playPause.click();
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        stepVideo(event.shiftKey ? -5 : -1);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        stepVideo(event.shiftKey ? 5 : 1);
+      } else if (event.key === "Enter") {
+        markCurrentPose();
+      } else if (event.key === "Backspace" || event.key === "Delete") {
+        deleteNearestLabel();
+      } else if (event.key.toLowerCase() === "v") {
+        els.visibleToggle.checked = !els.visibleToggle.checked;
+        els.visibleToggle.dispatchEvent(new Event("change"));
+      }
+    });
+
+    window.addEventListener("resize", resizeCanvas);
+    els.nudgeLeft.addEventListener("click", () => nudge(-1, 0));
+    els.nudgeRight.addEventListener("click", () => nudge(1, 0));
+    els.nudgeUp.addEventListener("click", () => nudge(0, 1));
+    els.nudgeDown.addEventListener("click", () => nudge(0, -1));
+
+    function selectRobot(index) {
+      state.selectedRobot = index;
+      [...els.robotButtons.children].forEach((btn) => {
+        btn.dataset.active = btn.dataset.robot === String(index) ? "true" : "false";
+      });
+      refreshPoseFromTimeline();
+      renderTrackList();
+    }
+
+    function ensurePose() {
+      if (!state.currentPose) {
+        const existing = sampleRobotAtTime(state.selectedRobot, els.video.currentTime, true);
+        state.currentPose = existing || {
+          t: els.video.currentTime || 0,
+          xIn: FIELD_SIZE_IN / 2,
+          yIn: FIELD_SIZE_IN / 2,
+          xPx: null,
+          yPx: null,
+          heading: 0,
+          visible: els.visibleToggle.checked
+        };
+      }
+      return state.currentPose;
+    }
+
+    function refreshPoseFromTimeline() {
+      const pose = sampleRobotAtTime(state.selectedRobot, els.video.currentTime, true);
+      state.currentPose = pose ? { ...pose } : null;
+      updatePoseInputs();
+      updateStatus();
+    }
+
+    function updatePoseInputs() {
+      const p = state.currentPose;
+      const enabled = !!p;
+      [els.xIn, els.yIn, els.headingRad, els.headingDeg].forEach((input) => {
+        input.disabled = !enabled;
+      });
+      if (!p) {
+        els.xIn.value = "";
+        els.yIn.value = "";
+        els.headingRad.value = "";
+        els.headingDeg.value = "";
+        els.visibleToggle.checked = true;
+        return;
+      }
+      els.xIn.value = finiteOrBlank(p.xIn, 2);
+      els.yIn.value = finiteOrBlank(p.yIn, 2);
+      els.headingRad.value = finiteOrBlank(p.heading, 4);
+      els.headingDeg.value = finiteOrBlank(p.heading * 180 / Math.PI, 1);
+      els.visibleToggle.checked = !!p.visible;
+    }
+
+    function syncPoseFromInputs() {
+      ensurePose();
+      const xIn = Number(els.xIn.value);
+      const yIn = Number(els.yIn.value);
+      const heading = Number(els.headingRad.value);
+      if (Number.isFinite(xIn)) state.currentPose.xIn = clamp(xIn, 0, FIELD_SIZE_IN);
+      if (Number.isFinite(yIn)) state.currentPose.yIn = clamp(yIn, 0, FIELD_SIZE_IN);
+      if (Number.isFinite(heading)) state.currentPose.heading = normalizeAngle(heading);
+      const px = fieldToImage(state.currentPose.xIn, state.currentPose.yIn);
+      state.currentPose.xPx = px ? px.x : null;
+      state.currentPose.yPx = px ? px.y : null;
+      updatePoseInputs();
+    }
+
+    function nudge(dx, dy) {
+      ensurePose();
+      const step = 1;
+      state.currentPose.xIn = clamp(state.currentPose.xIn + dx * step, 0, FIELD_SIZE_IN);
+      state.currentPose.yIn = clamp(state.currentPose.yIn + dy * step, 0, FIELD_SIZE_IN);
+      const px = fieldToImage(state.currentPose.xIn, state.currentPose.yIn);
+      state.currentPose.xPx = px ? px.x : state.currentPose.xPx;
+      state.currentPose.yPx = px ? px.y : state.currentPose.yPx;
+      updatePoseInputs();
+      markCurrentPose();
+    }
+
+    function markCurrentPose() {
+      if (!els.video.src) {
+        alert("Load a video first.");
+        return;
+      }
+      ensurePose();
+      const t = Number(els.video.currentTime || 0);
+      const pose = {
+        t,
+        xIn: clamp(Number(state.currentPose.xIn) || 0, 0, FIELD_SIZE_IN),
+        yIn: clamp(Number(state.currentPose.yIn) || 0, 0, FIELD_SIZE_IN),
+        xPx: Number.isFinite(state.currentPose.xPx) ? state.currentPose.xPx : null,
+        yPx: Number.isFinite(state.currentPose.yPx) ? state.currentPose.yPx : null,
+        heading: normalizeAngle(Number(state.currentPose.heading) || 0),
+        visible: !!state.currentPose.visible
+      };
+      const labels = state.labels[state.selectedRobot];
+      const tolerance = Math.max(0.002, 0.5 / getNominalFps());
+      const existingIndex = labels.findIndex((item) => Math.abs(item.t - t) <= tolerance);
+      if (existingIndex >= 0) {
+        labels[existingIndex] = pose;
+      } else {
+        labels.push(pose);
+      }
+      labels.sort((a, b) => a.t - b.t);
+      state.currentPose = { ...pose };
+      updatePoseInputs();
+      renderTrackList();
+      updateStatus();
+    }
+
+    function deleteNearestLabel() {
+      const labels = state.labels[state.selectedRobot];
+      if (!labels.length) return;
+      const t = Number(els.video.currentTime || 0);
+      let bestIndex = -1;
+      let bestDist = Infinity;
+      labels.forEach((item, index) => {
+        const dist = Math.abs(item.t - t);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIndex = index;
+        }
+      });
+      if (bestIndex >= 0 && bestDist <= Math.max(0.5, 3 / getNominalFps())) {
+        labels.splice(bestIndex, 1);
+        refreshPoseFromTimeline();
+        renderTrackList();
+        updateStatus();
+      }
+    }
+
+    function sampleRobotAtTime(robotIndex, t, allowNearest) {
+      const labels = state.labels[robotIndex];
+      if (!labels.length) return null;
+      const exactTolerance = Math.max(0.002, 0.5 / getNominalFps());
+      for (const label of labels) {
+        if (Math.abs(label.t - t) <= exactTolerance) return { ...label };
+      }
+      if (!els.interpolateToggle.checked) {
+        if (!allowNearest) return null;
+        return nearestLabel(labels, t);
+      }
+      let prev = null;
+      let next = null;
+      for (const label of labels) {
+        if (label.t <= t) prev = label;
+        if (label.t > t) {
+          next = label;
+          break;
+        }
+      }
+      if (prev && next) {
+        const span = Math.max(next.t - prev.t, 0.000001);
+        const alpha = clamp((t - prev.t) / span, 0, 1);
+        return {
+          t,
+          xIn: lerp(prev.xIn, next.xIn, alpha),
+          yIn: lerp(prev.yIn, next.yIn, alpha),
+          xPx: lerpNullable(prev.xPx, next.xPx, alpha),
+          yPx: lerpNullable(prev.yPx, next.yPx, alpha),
+          heading: interpolateAngle(prev.heading, next.heading, alpha),
+          visible: alpha < 0.5 ? prev.visible : next.visible
+        };
+      }
+      if (!allowNearest) return null;
+      return prev ? { ...prev, t } : { ...labels[0], t };
+    }
+
+    function nearestLabel(labels, t) {
+      let best = labels[0];
+      let bestDist = Math.abs(best.t - t);
+      for (const label of labels) {
+        const dist = Math.abs(label.t - t);
+        if (dist < bestDist) {
+          best = label;
+          bestDist = dist;
+        }
+      }
+      return { ...best, t };
+    }
+
+    function renderTrackList() {
+      els.trackList.innerHTML = "";
+      const labels = state.labels[state.selectedRobot];
+      if (!labels.length) {
+        const empty = document.createElement("div");
+        empty.className = "status";
+        empty.textContent = `R${state.selectedRobot} has no labels`;
+        els.trackList.appendChild(empty);
+        return;
+      }
+      labels.forEach((label, index) => {
+        const row = document.createElement("div");
+        row.className = "track-row";
+        const time = document.createElement("strong");
+        time.textContent = formatTime(label.t);
+        const pose = document.createElement("span");
+        pose.textContent = `${label.xIn.toFixed(1)}, ${label.yIn.toFixed(1)}, ${label.heading.toFixed(2)}`;
+        const go = document.createElement("button");
+        go.className = "pill";
+        go.textContent = label.visible ? "show" : "hide";
+        go.title = "Jump to label";
+        go.addEventListener("click", () => {
+          els.video.currentTime = label.t;
+          state.currentPose = { ...label };
+          updatePoseInputs();
+          updateTimeReadout();
+        });
+        row.addEventListener("dblclick", () => {
+          state.labels[state.selectedRobot].splice(index, 1);
+          refreshPoseFromTimeline();
+          renderTrackList();
+          updateStatus();
+        });
+        row.append(time, pose, go);
+        els.trackList.appendChild(row);
+      });
+    }
+
+    function exportCsv() {
+      const duration = els.video.duration || maxLabelTime();
+      const fps = clamp(Number(els.sampleRate.value) || getNominalFps(), 1, 120);
+      const start = clamp(Number(els.startOffset.value) || 0, 0, duration);
+      const endRaw = Number(els.endTime.value);
+      const end = clamp(Number.isFinite(endRaw) && endRaw > 0 ? endRaw : duration, start, duration || maxLabelTime());
+      const dt = 1 / fps;
+      const header = [
+        "timestamp_s",
+        "robot0_x_in", "robot0_y_in", "robot0_heading_rad", "robot0_visible",
+        "robot1_x_in", "robot1_y_in", "robot1_heading_rad", "robot1_visible",
+        "robot2_x_in", "robot2_y_in", "robot2_heading_rad", "robot2_visible",
+        "robot3_x_in", "robot3_y_in", "robot3_heading_rad", "robot3_visible"
+      ];
+      const rows = [header.join(",")];
+      const count = Math.max(1, Math.floor((end - start) / dt) + 1);
+      for (let i = 0; i < count; i += 1) {
+        const t = start + i * dt;
+        const matchTime = t - start;
+        const row = [matchTime.toFixed(4)];
+        for (let r = 0; r < ROBOT_COUNT; r += 1) {
+          const pose = sampleRobotAtTime(r, t, false);
+          if (pose && pose.visible) {
+            row.push(pose.xIn.toFixed(2), pose.yIn.toFixed(2), normalizeAngle(pose.heading).toFixed(4), "1");
+          } else if (pose) {
+            row.push(pose.xIn.toFixed(2), pose.yIn.toFixed(2), normalizeAngle(pose.heading).toFixed(4), "0");
+          } else {
+            row.push("0.00", "0.00", "0.0000", "0");
+          }
+        }
+        rows.push(row.join(","));
+      }
+      downloadText("manual_robot_positions.csv", rows.join("\n") + "\n", "text/csv");
+      setStatus(`Exported ${rows.length - 1} CSV rows`);
+    }
+
+    function exportJson() {
+      const payload = {
+        version: 1,
+        createdAt: new Date().toISOString(),
+        video: {
+          name: els.videoFile.files[0]?.name || null,
+          duration: els.video.duration || null,
+          fps: getNominalFps()
+        },
+        field: {
+          sizeIn: FIELD_SIZE_IN,
+          cornersPx: state.corners
+        },
+        export: {
+          sampleRateFps: Number(els.sampleRate.value) || getNominalFps(),
+          startOffsetS: Number(els.startOffset.value) || 0,
+          endTimeS: Number(els.endTime.value) || null,
+          interpolate: els.interpolateToggle.checked
+        },
+        robots: state.labels.map((labels, robot) => ({
+          robot,
+          labels
+        }))
+      };
+      downloadText("manual_tracker_session.json", JSON.stringify(payload, null, 2), "application/json");
+      setStatus("Exported JSON session");
+    }
+
+    function loadSession(session) {
+      if (session.field?.cornersPx) {
+        setCorners(parseCorners({ corners_px: session.field.cornersPx }));
+      }
+      if (Array.isArray(session.robots)) {
+        const next = Array.from({ length: ROBOT_COUNT }, () => []);
+        session.robots.forEach((robotItem, fallbackIndex) => {
+          const robot = Number.isInteger(robotItem.robot) ? robotItem.robot : fallbackIndex;
+          if (robot < 0 || robot >= ROBOT_COUNT || !Array.isArray(robotItem.labels)) return;
+          next[robot] = robotItem.labels.map(cleanLabel).filter(Boolean).sort((a, b) => a.t - b.t);
+        });
+        state.labels = next;
+      }
+      if (session.export) {
+        if (session.export.sampleRateFps) els.sampleRate.value = session.export.sampleRateFps;
+        if (session.export.startOffsetS != null) els.startOffset.value = session.export.startOffsetS;
+        if (session.export.endTimeS != null) els.endTime.value = session.export.endTimeS;
+        if (session.export.interpolate != null) els.interpolateToggle.checked = !!session.export.interpolate;
+      }
+      refreshPoseFromTimeline();
+      renderTrackList();
+      updateStatus();
+    }
+
+    function cleanLabel(label) {
+      const t = Number(label.t);
+      const xIn = Number(label.xIn);
+      const yIn = Number(label.yIn);
+      const heading = Number(label.heading);
+      if (![t, xIn, yIn, heading].every(Number.isFinite)) return null;
+      return {
+        t,
+        xIn: clamp(xIn, 0, FIELD_SIZE_IN),
+        yIn: clamp(yIn, 0, FIELD_SIZE_IN),
+        xPx: Number.isFinite(Number(label.xPx)) ? Number(label.xPx) : null,
+        yPx: Number.isFinite(Number(label.yPx)) ? Number(label.yPx) : null,
+        heading: normalizeAngle(heading),
+        visible: !!label.visible
+      };
+    }
+
+    function setCorners(corners) {
+      state.corners = corners;
+      state.homography = findHomography(corners, [
+        { x: 0, y: FIELD_SIZE_IN },
+        { x: FIELD_SIZE_IN, y: FIELD_SIZE_IN },
+        { x: FIELD_SIZE_IN, y: 0 },
+        { x: 0, y: 0 }
+      ]);
+      state.inverseHomography = invert3x3(state.homography);
+    }
+
+    function parseCorners(parsed) {
+      const raw = parsed.corners_px || parsed.cornersPx || parsed.corners;
+      if (!Array.isArray(raw) || raw.length !== 4) {
+        throw new Error("Expected four field corners.");
+      }
+      return raw.map((pt) => {
+        if (Array.isArray(pt)) return { x: Number(pt[0]), y: Number(pt[1]) };
+        return { x: Number(pt.x), y: Number(pt.y) };
+      }).map((pt) => {
+        if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) {
+          throw new Error("Corner coordinates must be numbers.");
+        }
+        return pt;
+      });
+    }
+
+    function imageToField(x, y) {
+      if (!state.homography) return { x: 0, y: 0 };
+      const p = applyHomography(state.homography, x, y);
+      return { x: clamp(p.x, 0, FIELD_SIZE_IN), y: clamp(p.y, 0, FIELD_SIZE_IN) };
+    }
+
+    function fieldToImage(x, y) {
+      if (!state.inverseHomography) return null;
+      return applyHomography(state.inverseHomography, x, y);
+    }
+
+    function findHomography(src, dst) {
+      const rows = [];
+      const values = [];
+      for (let i = 0; i < 4; i += 1) {
+        const x = src[i].x;
+        const y = src[i].y;
+        const u = dst[i].x;
+        const v = dst[i].y;
+        rows.push([x, y, 1, 0, 0, 0, -u * x, -u * y]);
+        values.push(u);
+        rows.push([0, 0, 0, x, y, 1, -v * x, -v * y]);
+        values.push(v);
+      }
+      const h = solveLinear(rows, values);
+      return [
+        [h[0], h[1], h[2]],
+        [h[3], h[4], h[5]],
+        [h[6], h[7], 1]
+      ];
+    }
+
+    function solveLinear(a, b) {
+      const n = b.length;
+      const m = a.map((row, i) => [...row, b[i]]);
+      for (let col = 0; col < n; col += 1) {
+        let pivot = col;
+        for (let r = col + 1; r < n; r += 1) {
+          if (Math.abs(m[r][col]) > Math.abs(m[pivot][col])) pivot = r;
+        }
+        if (Math.abs(m[pivot][col]) < 1e-12) throw new Error("Corners do not form a usable field.");
+        [m[col], m[pivot]] = [m[pivot], m[col]];
+        const div = m[col][col];
+        for (let c = col; c <= n; c += 1) m[col][c] /= div;
+        for (let r = 0; r < n; r += 1) {
+          if (r === col) continue;
+          const factor = m[r][col];
+          for (let c = col; c <= n; c += 1) m[r][c] -= factor * m[col][c];
+        }
+      }
+      return m.map((row) => row[n]);
+    }
+
+    function invert3x3(m) {
+      const a = m[0][0], b = m[0][1], c = m[0][2];
+      const d = m[1][0], e = m[1][1], f = m[1][2];
+      const g = m[2][0], h = m[2][1], i = m[2][2];
+      const det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+      if (Math.abs(det) < 1e-12) throw new Error("Could not invert field transform.");
+      return [
+        [(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+        [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+        [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det]
+      ];
+    }
+
+    function applyHomography(h, x, y) {
+      const den = h[2][0] * x + h[2][1] * y + h[2][2];
+      return {
+        x: (h[0][0] * x + h[0][1] * y + h[0][2]) / den,
+        y: (h[1][0] * x + h[1][1] * y + h[1][2]) / den
+      };
+    }
+
+    function resizeCanvas() {
+      const rect = els.overlay.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      els.overlay.width = Math.max(1, Math.round(rect.width * ratio));
+      els.overlay.height = Math.max(1, Math.round(rect.height * ratio));
+      const ctx = els.overlay.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      updateVideoView();
+    }
+
+    function updateVideoView() {
+      const rect = els.overlay.getBoundingClientRect();
+      const vw = els.video.videoWidth || 16;
+      const vh = els.video.videoHeight || 9;
+      const scale = Math.min(rect.width / vw, rect.height / vh);
+      const width = vw * scale;
+      const height = vh * scale;
+      state.view = {
+        scale,
+        offsetX: (rect.width - width) / 2,
+        offsetY: (rect.height - height) / 2,
+        width,
+        height
+      };
+    }
+
+    function eventToVideoPoint(event) {
+      updateVideoView();
+      const rect = els.overlay.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const v = state.view;
+      if (x < v.offsetX || y < v.offsetY || x > v.offsetX + v.width || y > v.offsetY + v.height) {
+        return null;
+      }
+      return {
+        x: (x - v.offsetX) / v.scale,
+        y: (y - v.offsetY) / v.scale
+      };
+    }
+
+    function videoToCanvas(pt) {
+      updateVideoView();
+      return {
+        x: state.view.offsetX + pt.x * state.view.scale,
+        y: state.view.offsetY + pt.y * state.view.scale
+      };
+    }
+
+    function drawLoop() {
+      drawOverlay();
+      requestAnimationFrame(drawLoop);
+    }
+
+    function drawOverlay() {
+      updateVideoView();
+      const canvas = els.overlay;
+      const ctx = canvas.getContext("2d");
+      const rect = canvas.getBoundingClientRect();
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      drawField(ctx);
+      drawRobots(ctx);
+    }
+
+    function drawField(ctx) {
+      if (!state.corners) return;
+      const pts = state.corners.map((pt) => videoToCanvas(pt));
+      ctx.save();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(255,150,38,0.82)";
+      ctx.fillStyle = "rgba(254,143,0,0.10)";
+      ctx.beginPath();
+      pts.forEach((pt, i) => {
+        if (i === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawRobots(ctx) {
+      const t = els.video.currentTime || 0;
+      for (let r = 0; r < ROBOT_COUNT; r += 1) {
+        const pose = r === state.selectedRobot && state.currentPose
+          ? state.currentPose
+          : sampleRobotAtTime(r, t, true);
+        if (!pose) continue;
+        let px = null;
+        if (Number.isFinite(pose.xPx) && Number.isFinite(pose.yPx)) {
+          px = { x: pose.xPx, y: pose.yPx };
+        } else {
+          px = fieldToImage(pose.xIn, pose.yIn);
+        }
+        if (!px) continue;
+        const pt = videoToCanvas(px);
+        const radius = r === state.selectedRobot ? 13 : 10;
+        ctx.save();
+        ctx.globalAlpha = pose.visible ? 1 : 0.38;
+        ctx.lineWidth = r === state.selectedRobot ? 3 : 2;
+        ctx.strokeStyle = COLORS[r];
+        ctx.fillStyle = "rgba(8,8,8,0.74)";
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        const dx = Math.cos(pose.heading) * (radius + 12);
+        const dy = -Math.sin(pose.heading) * (radius + 12);
+        ctx.beginPath();
+        ctx.moveTo(pt.x, pt.y);
+        ctx.lineTo(pt.x + dx, pt.y + dy);
+        ctx.stroke();
+        ctx.fillStyle = COLORS[r];
+        ctx.font = "700 12px ui-sans-serif, system-ui";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(`R${r}`, pt.x, pt.y);
+        ctx.restore();
+      }
+    }
+
+    function stepVideo(direction) {
+      if (!els.video.src) return;
+      els.video.pause();
+      const step = getStepSeconds() * direction;
+      els.video.currentTime = clamp((els.video.currentTime || 0) + step, 0, els.video.duration || 0);
+      refreshPoseFromTimeline();
+      updateTimeReadout();
+    }
+
+    function getStepSeconds() {
+      const value = els.stepSize.value;
+      if (value === "1s") return 1;
+      return Number(value) / getNominalFps();
+    }
+
+    function getNominalFps() {
+      return clamp(Number(els.sampleRate.value) || state.fps || 30, 1, 120);
+    }
+
+    function detectFpsFromName(name) {
+      if (!name) return null;
+      const match = name.match(/(\d{2,3})\s*fps/i);
+      return match ? Number(match[1]) : null;
+    }
+
+    function updateTimeReadout() {
+      els.timeReadout.textContent = `${formatTime(els.video.currentTime || 0)} / ${formatTime(els.video.duration || 0)}`;
+    }
+
+    function updateStatus() {
+      const counts = state.labels.map((labels) => labels.length);
+      const total = counts.reduce((sum, count) => sum + count, 0);
+      if (!total) {
+        els.status.textContent = "No labels yet";
+      } else {
+        els.status.textContent = counts.map((count, i) => `R${i}:${count}`).join("  ");
+      }
+    }
+
+    function setStatus(message) {
+      els.status.textContent = message;
+      window.setTimeout(updateStatus, 2200);
+    }
+
+    function maxLabelTime() {
+      let max = 0;
+      state.labels.forEach((labels) => {
+        labels.forEach((label) => {
+          max = Math.max(max, label.t);
+        });
+      });
+      return max;
+    }
+
+    function downloadText(filename, content, type) {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function formatTime(value) {
+      return (Number(value) || 0).toFixed(3);
+    }
+
+    function finiteOrBlank(value, digits) {
+      return Number.isFinite(value) ? value.toFixed(digits) : "";
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function lerpNullable(a, b, t) {
+      if (Number.isFinite(a) && Number.isFinite(b)) return lerp(a, b, t);
+      return Number.isFinite(a) ? a : Number.isFinite(b) ? b : null;
+    }
+
+    function normalizeAngle(angle) {
+      let a = angle;
+      while (a <= -Math.PI) a += Math.PI * 2;
+      while (a > Math.PI) a -= Math.PI * 2;
+      return a;
+    }
+
+    function interpolateAngle(a, b, t) {
+      const delta = normalizeAngle(b - a);
+      return normalizeAngle(a + delta * t);
+    }
+  </script>
+</body>
+</html>

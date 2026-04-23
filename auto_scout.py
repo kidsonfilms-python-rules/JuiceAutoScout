@@ -43,6 +43,7 @@ Changes in v3.2 — multi-robot merge fixes only:
 
 import argparse
 import csv
+import itertools
 import json
 import math
 import os
@@ -234,6 +235,8 @@ class RobotTracker:
     BALL_MASK_OPEN_FRAC = 0.030
     BALL_MASK_CLOSE_FRAC = 0.055
     BALL_MASK_DILATE_FRAC = 0.070
+    INIT_MAX_CANDIDATES = 8
+    INIT_MIN_SPACING_IN = 8.0
 
     def __init__(self, cv2, np):
         self.cv2, self.np = cv2, np
@@ -258,6 +261,21 @@ class RobotTracker:
         self._merge_groups: Dict[FrozenSet, MergeGroup] = {}
         self._underresolved_tracks = set()
         self._last_ball_mask = None
+        # Static blob suppression: track per-blob pixel location history
+        # Format: {approx_pixel_key: consecutive_static_frames}
+        self._blob_static_counts: dict = {}
+        self._blob_static_positions: dict = {}
+        # How many frames a blob must stay within STATIC_BLOB_MOVE_PX to be suppressed
+        self.STATIC_BLOB_SUPPRESS_FRAMES = 20
+        # If blob moves less than this many pixels, count it as static
+        self.STATIC_BLOB_MOVE_PX = 8
+
+        # Corner structure exclusion zone (field coords, inches).
+        # The physical corner posts create persistent FG blobs that trap R0/R3.
+        # Suppress blobs inside these corner zones unless a track is actively moving.
+        # Zone: x < CORNER_ZONE_IN  for y < CORNER_ZONE_IN  (top-left and top-right)
+        self.CORNER_ZONE_IN = 22.0   # 22-inch square at each top corner
+        self._frame_counter = 0      # for corner zone timing
 
     # ── setup ────────────────────────────────────────────────────────────
 
@@ -336,20 +354,12 @@ class RobotTracker:
         self._underresolved_tracks = self._find_underresolved_tracks(blobs)
 
         if not self._initialized:
-            if len(blobs) < 4:
+            lineup = self._select_bootstrap_lineup(blobs)
+            if lineup is None:
                 for p in self.tracked_poses:
                     p.visible = False
                 return self.tracked_poses
-            for i, b in enumerate(sorted(blobs[:4], key=lambda b: b[0])):
-                fx, fy, hdg, _pid, cx, cy, _qual, _nsplit, _cnt, *_rest = b
-                self._pos[i]    = (fx, fy)
-                self._pos_px[i] = (cx, cy)
-                self._coast[i]  = 0
-                self.tracked_poses[i].x_in    = fx
-                self.tracked_poses[i].y_in    = fy
-                self.tracked_poses[i].heading = hdg
-                self.tracked_poses[i].visible = True
-            self._initialized = True
+            self._initialize_tracks_from_lineup(lineup, "best visible 4-blob lineup")
             return self.tracked_poses
 
         assignment = self._assign(blobs)
@@ -437,6 +447,42 @@ class RobotTracker:
                         i, self.tracked_poses[i].heading)
 
         return self.tracked_poses
+
+    def _initialize_tracks_from_lineup(self, lineup, reason: str):
+        for i, (fx, fy, cx, cy) in enumerate(lineup):
+            self._pos[i] = (fx, fy)
+            self._pos_px[i] = (cx, cy)
+            self._vel[i] = (0.0, 0.0)
+            self._vel_px[i] = (0.0, 0.0)
+            self._coast[i] = 0
+            self.tracked_poses[i].x_in = fx
+            self.tracked_poses[i].y_in = fy
+            self.tracked_poses[i].heading = 0.0
+            self.tracked_poses[i].visible = True
+        self._initialized = True
+        print("[INFO] Tracker initialized from {}.".format(reason))
+
+    def _select_bootstrap_lineup(self, blobs):
+        if len(blobs) < 4:
+            return None
+
+        candidate_pool = blobs[:min(len(blobs), self.INIT_MAX_CANDIDATES)]
+        best = None
+        best_score = float("inf")
+        for combo in itertools.combinations(candidate_pool, 4):
+            lineup = sorted(combo, key=lambda b: b[0])
+            spacing_penalty = 0.0
+            for left, right in zip(lineup, lineup[1:]):
+                gap = right[0] - left[0]
+                if gap < self.INIT_MIN_SPACING_IN:
+                    spacing_penalty += (self.INIT_MIN_SPACING_IN - gap) ** 2
+
+            score = sum(b[6] for b in lineup) + 0.04 * spacing_penalty
+            if score < best_score:
+                best_score = score
+                best = [(float(b[0]), float(b[1]), float(b[4]), float(b[5]))
+                        for b in lineup]
+        return best
 
     # ── optimal assignment ────────────────────────────────────────────────
 
@@ -1075,6 +1121,7 @@ class RobotTracker:
 
     def _get_blobs(self, frame):
         cv2, np = self.cv2, self.np
+        self._frame_counter += 1
         fg = self._foreground_mask(frame)
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -1103,11 +1150,80 @@ class RobotTracker:
                 fx, fy = float(fp[0]), float(fp[1])
                 if not (0 <= fx <= 144 and 0 <= fy <= 144):
                     continue
+                # ── Corner zone suppression ─────────────────────────────────
+                # Blobs inside the top-left or top-right corner zones are
+                # suppressed unless a robot is known to be actively moving there.
+                cz = self.CORNER_ZONE_IN
+                in_corner_zone = (
+                    (fx < cz and fy < cz) or           # top-left corner
+                    (fx > 144 - cz and fy < cz)        # top-right corner
+                )
+                if self._initialized and in_corner_zone:
+                    # Allow if an actively tracked robot is already nearby.
+                    robot_present = False
+                    for tid in range(4):
+                        if self._pos[tid] is None:
+                            continue
+                        tx, ty = self._pos[tid]
+                        dist = math.hypot(fx - tx, fy - ty)
+                        if dist < self.ROBOT_SIZE_IN * 1.5 and self._coast[tid] <= self.VISIBLE_COAST:
+                            robot_present = True
+                            break
+                    if not robot_present:
+                        continue
+                # ── end corner zone suppression ─────────────────────────────
                 candidates.append((fx, fy, 0.0, per_area, parent_id,
                                     int(cx), int(cy), quality_penalty,
                                     len(sub_centers), c))
 
         candidates.sort(key=lambda b: -b[3])
+
+        # ── Static blob suppression ─────────────────────────────────────────
+        # Corner structures and other stationary FG objects create persistent
+        # blobs that confuse robot tracking.  Any candidate whose centroid has
+        # stayed within STATIC_BLOB_MOVE_PX pixels for STATIC_BLOB_SUPPRESS_FRAMES
+        # consecutive frames is dropped UNLESS a current track is already assigned
+        # very close to it (which would mean it really is a robot sitting still).
+        if self._initialized:
+            filtered = []
+            new_static: dict = {}
+            new_static_positions: dict = {}
+            for entry in candidates:
+                fx, fy, hdg, _a, pid, cx, cy, qual, nsplit, cnt = entry
+                # Bucket this centroid to a coarse grid for history lookup
+                key = (round(cx / self.STATIC_BLOB_MOVE_PX),
+                       round(cy / self.STATIC_BLOB_MOVE_PX))
+                # Find closest existing static key
+                matched_key = None
+                for k in self._blob_static_positions:
+                    okx, oky = self._blob_static_positions[k]
+                    if abs(cx - okx) < self.STATIC_BLOB_MOVE_PX and abs(cy - oky) < self.STATIC_BLOB_MOVE_PX:
+                        matched_key = k
+                        break
+                if matched_key is not None:
+                    count = self._blob_static_counts.get(matched_key, 0) + 1
+                    new_static[matched_key] = count
+                    new_static_positions[matched_key] = (cx, cy)
+                    near_track = any(
+                        self._pos[tid] is not None
+                        and math.hypot(fx - self._pos[tid][0], fy - self._pos[tid][1]) < self.ROBOT_SIZE_IN * 1.5
+                        and self._coast[tid] <= self.VISIBLE_COAST
+                        for tid in range(4)
+                    )
+                    if count >= self.STATIC_BLOB_SUPPRESS_FRAMES and not near_track:
+                        continue
+                else:
+                    new_static[key] = 1
+                    new_static_positions[key] = (cx, cy)
+                filtered.append(entry)
+            self._blob_static_counts = new_static
+            self._blob_static_positions = new_static_positions
+            candidates = filtered
+        else:
+            self._blob_static_counts = {}
+            self._blob_static_positions = {}
+        # ── end static blob suppression ─────────────────────────────────────
+
         return [(fx, fy, hdg, pid, cx, cy, qual, nsplit, cnt)
                 for fx, fy, hdg, _a, pid, cx, cy, qual, nsplit, cnt in candidates]
 
@@ -1421,6 +1537,7 @@ def process_match(
     debug_every_n     = 10,
     debug_enable_hitboxes = False,
     manual_corners_px = None,
+    robot_init_positions = None,  # list of 4 [x_in, y_in] field coords sorted by robot id
 ):
     cv2 = _require("cv2", "opencv-python")
     np  = _require("numpy")
@@ -1498,6 +1615,26 @@ def process_match(
             print("[INFO] Median background saved: {}".format(bg_path))
     else:
         print("[WARN] No corners — will attempt auto-detection.")
+
+    # --- Manual robot initialization (bypasses blob-based init) ---
+    if robot_init_positions is not None and H_inv is not None:
+        print("[INFO] Using manual robot init positions — bypassing blob-based init.")
+        for i, (fx, fy) in enumerate(robot_init_positions[:4]):
+            pt = np.array([[[float(fx), float(fy)]]], np.float32)
+            ip = cv2.perspectiveTransform(pt, H_inv)[0][0]
+            cx, cy = float(ip[0]), float(ip[1])
+            tracker._pos[i]    = (fx, fy)
+            tracker._pos_px[i] = (cx, cy)
+            tracker._coast[i]  = 0
+            tracker.tracked_poses[i].x_in    = fx
+            tracker.tracked_poses[i].y_in    = fy
+            tracker.tracked_poses[i].heading = 0.0
+            tracker.tracked_poses[i].visible = True
+            print("[INFO]   Robot{}: field=({:.1f},{:.1f}) pixel=({:.0f},{:.0f})".format(
+                i, fx, fy, cx, cy))
+        tracker._initialized = True
+        print("[INFO] Tracker force-initialized with {} robots.".format(
+            len(robot_init_positions[:4])))
 
     frame_num = start_frame; processed = 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame if start_frame > 0 else 0)
@@ -1753,6 +1890,15 @@ def main():
     p.add_argument("--video-path",   default=None)
     p.add_argument("--corners",      default=None,
                    help="field_corners.json from ftc_calibrate.py")
+    p.add_argument("--robot-init-positions", default=None,
+                   help=(
+                       "JSON file or inline JSON string with starting field positions "
+                       "for all 4 robots, sorted by robot id. "
+                       "Format: [[x0,y0],[x1,y1],[x2,y2],[x3,y3]] in inches. "
+                       "Bypasses blob-based init (required when robots start under "
+                       "corner structures or are otherwise hard to detect at t=0). "
+                       "Example: --robot-init-positions "
+                       "'[[19.3,1.6],[59.4,125.0],[87.8,132.6],[129.5,16.3]]'"))
     args = p.parse_args()
 
     if args.no_download:
@@ -1772,15 +1918,26 @@ def main():
             corners = json.load(f)["corners_px"]
         print("[INFO] Corners:", args.corners)
 
+    robot_init = None
+    if args.robot_init_positions:
+        raw = args.robot_init_positions.strip()
+        if os.path.isfile(raw):
+            with open(raw) as f:
+                robot_init = json.load(f)
+        else:
+            robot_init = json.loads(raw)
+        print("[INFO] Robot init positions:", robot_init)
+
     process_match(
-        video_path        = video_path,
-        output_dir        = args.output_dir,
-        start_offset_sec  = args.start_offset,
-        sample_rate_fps   = args.sample_rate,
-        debug             = args.debug,
-        debug_every_n     = args.debug_every,
-        debug_enable_hitboxes = args.debug_enable_hitboxes,
-        manual_corners_px = corners,
+        video_path           = video_path,
+        output_dir           = args.output_dir,
+        start_offset_sec     = args.start_offset,
+        sample_rate_fps      = args.sample_rate,
+        debug                = args.debug,
+        debug_every_n        = args.debug_every,
+        debug_enable_hitboxes= args.debug_enable_hitboxes,
+        manual_corners_px    = corners,
+        robot_init_positions = robot_init,
     )
 
 

@@ -196,6 +196,7 @@ class MergeGroup:
     entry_order    : List[int]             = dc_field(default_factory=list)
     current_order  : List[int]             = dc_field(default_factory=list)
     peak_assignment: dict                  = dc_field(default_factory=dict)
+    order_votes    : dict                  = dc_field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +245,9 @@ class RobotTracker:
     REID_CROP_SCALE = 0.55
     REID_COST_WEIGHT = 1.60
     REID_COST_WEIGHT_REACQ = 2.70
+    POST_MERGE_LOCK_FRAMES = 12
+    POST_MERGE_LOCK_WEIGHT = 1.25
+    POST_MERGE_LOCK_REJECT_PX = 115.0
 
     def __init__(self, cv2, np):
         self.cv2, self.np = cv2, np
@@ -267,6 +271,7 @@ class RobotTracker:
 
         self._merge_groups: Dict[FrozenSet, MergeGroup] = {}
         self._underresolved_tracks = set()
+        self._post_merge_locks = [None] * 4
         self._last_ball_mask = None
         self._reid_refs: Optional[Dict[int, List]] = None
         # Static blob suppression: track per-blob pixel location history
@@ -357,6 +362,18 @@ class RobotTracker:
         for i in range(4):
             if self._merge_recent[i] > 0:
                 self._merge_recent[i] -= 1
+            lock = self._post_merge_locks[i]
+            if lock is not None:
+                lock["frames_left"] -= 1
+                if lock["frames_left"] <= 0:
+                    self._post_merge_locks[i] = None
+                else:
+                    img_pos = lock["img_pos"]
+                    img_vel = lock["img_vel"]
+                    field_pos = lock["field_pos"]
+                    field_vel = lock["field_vel"]
+                    lock["img_pos"] = (img_pos[0] + img_vel[0], img_pos[1] + img_vel[1])
+                    lock["field_pos"] = (field_pos[0] + field_vel[0], field_pos[1] + field_vel[1])
 
         blobs = self._get_blobs(frame)
         self._underresolved_tracks = self._find_underresolved_tracks(blobs)
@@ -399,7 +416,11 @@ class RobotTracker:
         for key in list(self._merge_groups.keys()):
             if key not in active_keys:
                 mg = self._merge_groups.pop(key)
-                self._apply_separation(mg)
+                if len(mg.track_ids) > 2 and self._relabel_multi_merge_exit(mg, blobs, assignment):
+                    for tid in mg.track_ids:
+                        self._merge_recent[tid] = self.MERGE_HOLD
+                else:
+                    self._apply_separation(mg)
 
         # tracks inside a 2-robot merge have positions frozen (handled below)
         # tracks inside a 3+ robot merge get positions from peak_assignment
@@ -423,6 +444,7 @@ class RobotTracker:
                 self.tracked_poses[i].y_in = fy
                 self.tracked_poses[i].visible = True
                 self._update_track_motion(i, (fx, fy), (px, py))
+                self._update_post_merge_lock(i, (fx, fy), (px, py))
                 self.tracked_poses[i].heading = self._motion_heading(
                     i, self.tracked_poses[i].heading)
                 self._pos[i] = (fx, fy)
@@ -436,6 +458,7 @@ class RobotTracker:
                 self.tracked_poses[i].visible = True
                 if i not in two_merged_tracks:
                     self._update_track_motion(i, (fx, fy), (cx, cy))
+                    self._update_post_merge_lock(i, (fx, fy), (cx, cy))
                     self.tracked_poses[i].heading = self._motion_heading(
                         i, self.tracked_poses[i].heading)
                     self._pos[i]    = (fx, fy)
@@ -455,6 +478,38 @@ class RobotTracker:
                         i, self.tracked_poses[i].heading)
 
         return self.tracked_poses
+
+    def _update_post_merge_lock(self, track_id: int, field_pos, image_pos) -> None:
+        lock = self._post_merge_locks[track_id]
+        if lock is None:
+            return
+        prev_img = lock["img_pos"]
+        prev_field = lock["field_pos"]
+        lock["img_vel"] = (float(image_pos[0]) - prev_img[0], float(image_pos[1]) - prev_img[1])
+        lock["field_vel"] = (float(field_pos[0]) - prev_field[0], float(field_pos[1]) - prev_field[1])
+        lock["img_pos"] = (float(image_pos[0]), float(image_pos[1]))
+        lock["field_pos"] = (float(field_pos[0]), float(field_pos[1]))
+
+    def _prime_post_merge_lock(self, track_id: int, field_pos, image_pos, prev_image_pos=None) -> None:
+        prev_field = self._pos[track_id] if self._pos[track_id] is not None else field_pos
+        if prev_image_pos is None:
+            img_vel = (0.0, 0.0)
+        else:
+            img_vel = (
+                float(image_pos[0]) - float(prev_image_pos[0]),
+                float(image_pos[1]) - float(prev_image_pos[1]),
+            )
+        field_vel = (
+            float(field_pos[0]) - float(prev_field[0]),
+            float(field_pos[1]) - float(prev_field[1]),
+        )
+        self._post_merge_locks[track_id] = {
+            "frames_left": self.POST_MERGE_LOCK_FRAMES,
+            "img_pos": (float(image_pos[0]), float(image_pos[1])),
+            "img_vel": img_vel,
+            "field_pos": (float(field_pos[0]), float(field_pos[1])),
+            "field_vel": field_vel,
+        }
 
     def _initialize_tracks_from_lineup(self, lineup, reason: str):
         for i, (fx, fy, cx, cy) in enumerate(lineup):
@@ -515,6 +570,14 @@ class RobotTracker:
                     continue
                 if not self._is_plausible_match(i, b, d_field, d_img):
                     continue
+                lock = self._post_merge_locks[i]
+                if lock is not None:
+                    lock_img_x, lock_img_y = lock["img_pos"]
+                    d_lock_img = math.hypot(b[4] - lock_img_x, b[5] - lock_img_y)
+                    if d_lock_img > self.POST_MERGE_LOCK_REJECT_PX:
+                        continue
+                else:
+                    d_lock_img = 0.0
                 dist_scale = (self.MAX_REACQ_IN
                               if self._coast[i] > self.VISIBLE_COAST
                               else self.MAX_DIST_IN)
@@ -532,6 +595,8 @@ class RobotTracker:
                     + 0.35 * img_cost
                     + qual_cost
                     + appearance_weight * appearance_cost
+                    + self.POST_MERGE_LOCK_WEIGHT * (
+                        d_lock_img / max(self._robot_max_px, 1.0))
                 )
 
         if n == 0:
@@ -546,6 +611,8 @@ class RobotTracker:
                     skip_cost_i = SKIP_COST * (1.8 + 0.7 * coast_frac)
                 if self._merge_recent[i] > 0:
                     skip_cost_i = min(skip_cost_i, SKIP_COST * 0.8)
+                if self._post_merge_locks[i] is not None:
+                    skip_cost_i += 0.6
             else:
                 skip_cost_i = SKIP_COST * 0.9
             skip_cols[i, i] = skip_cost_i
@@ -696,6 +763,12 @@ class RobotTracker:
         # Seed peak_assignment with entry positions so we have valid state
         # immediately (guards against first-frame stale-peak scenario, fix g)
         peak_assignment = {tid: (px, py) for tid, px, py in positions}
+        order_votes = {
+            tid: [0.0] * len(entry_order)
+            for tid in track_ids
+        }
+        for slot, tid in enumerate(entry_order):
+            order_votes[tid][slot] += 1.0
 
         return MergeGroup(
             track_ids      = list(track_ids),
@@ -705,6 +778,7 @@ class RobotTracker:
             entry_order    = entry_order,
             current_order  = list(entry_order),   # starts as identity permutation
             peak_assignment= peak_assignment,
+            order_votes    = order_votes,
         )
 
     def _update_crossing(self, mg: MergeGroup, contour) -> None:
@@ -794,15 +868,41 @@ class RobotTracker:
 
         mg.peak_assignment = new_assignment
 
-        # Update current_order: sort track IDs by their assigned peak projection
-        # Only update if we assigned at least as many peaks as we have tracks
-        # (if we had fewer peaks, the order might be partially stale — keep last)
-        if successfully_assigned >= n:
-            mg.current_order = sorted(
-                mg.track_ids,
-                key=lambda tid: _proj(*mg.peak_assignment[tid])
-                if tid in mg.peak_assignment else 0.0
-            )
+        projected_order = sorted(
+            mg.track_ids,
+            key=lambda tid: _proj(*mg.peak_assignment[tid])
+            if tid in mg.peak_assignment else 0.0
+        )
+        mg.current_order = projected_order
+        self._record_merge_order(
+            mg,
+            projected_order,
+            weight=1.0 if successfully_assigned >= n else 0.35,
+        )
+
+    def _record_merge_order(self, mg: MergeGroup, order: List[int], weight: float) -> None:
+        if not mg.order_votes or not order:
+            return
+        for slot, tid in enumerate(order):
+            if tid not in mg.order_votes:
+                mg.order_votes[tid] = [0.0] * len(order)
+            if slot < len(mg.order_votes[tid]):
+                mg.order_votes[tid][slot] += weight
+
+    def _resolve_merge_order(self, mg: MergeGroup) -> List[int]:
+        if not mg.order_votes:
+            return list(mg.current_order or mg.entry_order)
+
+        best_order = None
+        best_score = float("-inf")
+        for order in itertools.permutations(mg.track_ids):
+            score = 0.0
+            for slot, tid in enumerate(order):
+                score += mg.order_votes.get(tid, [0.0] * len(order))[slot]
+            if score > best_score:
+                best_score = score
+                best_order = list(order)
+        return best_order or list(mg.current_order or mg.entry_order)
 
     def _apply_separation(self, mg: MergeGroup) -> None:
         """
@@ -920,6 +1020,145 @@ class RobotTracker:
         else:
             print("[INFO] Multi-robot merge resolved, no permutation: {}".format(
                 sorted(mg.track_ids)))
+
+    def _relabel_multi_merge_exit(self, mg: MergeGroup, blobs, assignment: Dict[int, int]) -> bool:
+        if not blobs or len(mg.track_ids) <= 2:
+            return False
+
+        expected_order = self._resolve_merge_order(mg)
+        if len(expected_order) != len(mg.track_ids):
+            expected_order = list(mg.current_order or mg.entry_order)
+        if len(expected_order) != len(mg.track_ids):
+            return False
+
+        slot_for_tid = {tid: slot for slot, tid in enumerate(expected_order)}
+        ax, ay = mg.entry_axis
+        peak_points = [mg.peak_assignment.get(tid) for tid in mg.track_ids if tid in mg.peak_assignment]
+        if not peak_points:
+            return False
+        center_x = sum(px for px, _py in peak_points) / len(peak_points)
+        center_y = sum(py for _px, py in peak_points) / len(peak_points)
+
+        def _proj(px, py):
+            return (px - center_x) * ax + (py - center_y) * ay
+
+        candidate_set = set()
+        for tid in mg.track_ids:
+            if tid in assignment:
+                candidate_set.add(assignment[tid])
+
+        blob_ranked = []
+        for bi, blob in enumerate(blobs):
+            cx, cy = float(blob[4]), float(blob[5])
+            nearest_peak = min(
+                math.hypot(cx - px, cy - py)
+                for px, py in peak_points
+            )
+            if nearest_peak <= self._robot_max_px * 2.6:
+                blob_ranked.append((nearest_peak, bi))
+
+        blob_ranked.sort()
+        for _dist, bi in blob_ranked:
+            candidate_set.add(bi)
+            if len(candidate_set) >= min(len(blobs), len(mg.track_ids) + 4):
+                break
+
+        # Pull in the top continuation candidates for each track separately.
+        # This matters when a robot explodes outward on the split frame and is
+        # slightly farther from the merge peaks than the tighter cluster blobs.
+        for tid in mg.track_ids:
+            peak = mg.peak_assignment.get(tid)
+            pred_field = self._predict_field_pos(tid)
+            per_track = []
+            for bi, blob in enumerate(blobs):
+                d_peak = 0.0
+                if peak is not None:
+                    d_peak = math.hypot(float(blob[4]) - peak[0], float(blob[5]) - peak[1])
+                d_field = math.hypot(float(blob[0]) - pred_field[0], float(blob[1]) - pred_field[1])
+                appearance_cost = self._appearance_cost(tid, blob)
+                per_track.append((
+                    d_peak / max(self._robot_max_px, 1.0)
+                    + 0.6 * d_field / max(self.MAX_REACQ_IN, 1.0)
+                    + 1.4 * appearance_cost,
+                    bi,
+                ))
+            per_track.sort()
+            for _score, bi in per_track[:3]:
+                candidate_set.add(bi)
+
+        candidate_indices = list(candidate_set)
+        if len(candidate_indices) < len(mg.track_ids):
+            return False
+
+        sorted_candidates = sorted(candidate_indices, key=lambda bi: _proj(blobs[bi][4], blobs[bi][5]))
+
+        best_cost = float("inf")
+        best_map = None
+        for chosen in itertools.combinations(sorted_candidates, len(mg.track_ids)):
+            total_cost = 0.0
+            valid = True
+            for slot, (tid, bi) in enumerate(zip(expected_order, chosen)):
+                blob = blobs[bi]
+                peak = mg.peak_assignment.get(tid)
+                if peak is None:
+                    peak = self._predict_image_pos(tid)
+                pred_field = self._predict_field_pos(tid)
+                d_img = math.hypot(float(blob[4]) - peak[0], float(blob[5]) - peak[1])
+                d_field = math.hypot(float(blob[0]) - pred_field[0], float(blob[1]) - pred_field[1])
+                appearance_cost = self._appearance_cost(tid, blob)
+                slot_penalty = abs(slot - slot_for_tid[tid])
+                lock = self._post_merge_locks[tid]
+                if lock is not None:
+                    lock_img_x, lock_img_y = lock["img_pos"]
+                    d_lock = math.hypot(float(blob[4]) - lock_img_x, float(blob[5]) - lock_img_y)
+                else:
+                    d_lock = 0.0
+
+                total_cost += (
+                    d_img / max(self._robot_max_px, 1.0)
+                    + 0.55 * d_field / max(self.MAX_DIST_IN, 1.0)
+                    + 1.9 * appearance_cost
+                    + 0.65 * slot_penalty
+                    + 0.8 * d_lock / max(self._robot_max_px, 1.0)
+                )
+
+                if d_img > self._robot_max_px * 3.6 and appearance_cost > 0.25:
+                    valid = False
+                    break
+
+            if valid and total_cost < best_cost:
+                best_cost = total_cost
+                best_map = {
+                    tid: bi
+                    for tid, bi in zip(expected_order, chosen)
+                }
+
+        if best_map is None:
+            return False
+
+        chosen_blob_indices = set(best_map.values())
+        for tid, bi in list(assignment.items()):
+            if tid not in mg.track_ids and bi in chosen_blob_indices:
+                del assignment[tid]
+        for tid, bi in best_map.items():
+            assignment[tid] = bi
+            fx, fy = float(blobs[bi][0]), float(blobs[bi][1])
+            cx, cy = float(blobs[bi][4]), float(blobs[bi][5])
+            self._prime_post_merge_lock(
+                tid,
+                (fx, fy),
+                (cx, cy),
+                prev_image_pos=mg.peak_assignment.get(tid),
+            )
+
+        swaps = []
+        for slot, tid in enumerate(expected_order):
+            previous_tid = mg.entry_order[slot] if slot < len(mg.entry_order) else tid
+            if previous_tid != tid:
+                swaps.append("R{}←slot{}".format(previous_tid, slot))
+        print("[INFO] Multi-robot merge relabeled from exit blobs: {}".format(
+            sorted(mg.track_ids)))
+        return True
 
     def _reanchor_from_peaks(self, track_ids, peak_assignment):
         """Fallback: re-anchor each track to its last-known peak, in-place."""

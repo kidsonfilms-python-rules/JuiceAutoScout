@@ -237,6 +237,13 @@ class RobotTracker:
     BALL_MASK_DILATE_FRAC = 0.070
     INIT_MAX_CANDIDATES = 8
     INIT_MIN_SPACING_IN = 8.0
+    REID_HIST_H_BINS = 18
+    REID_HIST_S_BINS = 16
+    REID_SAMPLE_STRIDE = 15
+    REID_MAX_SAMPLES_PER_ROBOT = 48
+    REID_CROP_SCALE = 0.55
+    REID_COST_WEIGHT = 1.60
+    REID_COST_WEIGHT_REACQ = 2.70
 
     def __init__(self, cv2, np):
         self.cv2, self.np = cv2, np
@@ -261,6 +268,7 @@ class RobotTracker:
         self._merge_groups: Dict[FrozenSet, MergeGroup] = {}
         self._underresolved_tracks = set()
         self._last_ball_mask = None
+        self._reid_refs: Optional[Dict[int, List]] = None
         # Static blob suppression: track per-blob pixel location history
         # Format: {approx_pixel_key: consecutive_static_frames}
         self._blob_static_counts: dict = {}
@@ -513,7 +521,18 @@ class RobotTracker:
                 dist_cost = d_field / max(dist_scale, 1.0)
                 img_cost  = d_img / max(self._robot_max_px * 1.25, 1.0)
                 qual_cost = b[6]
-                real_cost[i, j] = dist_cost + 0.35 * img_cost + qual_cost
+                appearance_cost = self._appearance_cost(i, b)
+                appearance_weight = (
+                    self.REID_COST_WEIGHT_REACQ
+                    if self._coast[i] > self.VISIBLE_COAST
+                    else self.REID_COST_WEIGHT
+                )
+                real_cost[i, j] = (
+                    dist_cost
+                    + 0.35 * img_cost
+                    + qual_cost
+                    + appearance_weight * appearance_cost
+                )
 
         if n == 0:
             return {}
@@ -739,7 +758,6 @@ class RobotTracker:
 
         # Build new assignment: for each track, find nearest unused peak
         new_assignment = dict(mg.peak_assignment)  # start from last good state
-        used_peaks = set()
 
         # Use current positions (updated each frame from peaks) not entry positions
         track_current_px = []
@@ -757,13 +775,10 @@ class RobotTracker:
                 else:
                     track_current_px.append((tid, mcx, mcy))
 
-        # Greedy nearest-peak assignment (globally optimal would need
-        # Hungarian here too, but n<=4 peaks means greedy is fine with
-        # the sorted-by-projection tie-breaking below)
         # Sort tracks by current projection so nearby tracks compete fairly
         track_current_px.sort(key=lambda t: _proj(t[1], t[2]))
-
         successfully_assigned = 0
+        used_peaks = set()
         for tid, tx, ty in track_current_px:
             best_d, best_k = float('inf'), None
             for k, (px, py) in enumerate(sorted_peaks):
@@ -1172,9 +1187,10 @@ class RobotTracker:
                     if not robot_present:
                         continue
                 # ── end corner zone suppression ─────────────────────────────
+                appearance = self._extract_appearance_feature(frame, int(cx), int(cy), c)
                 candidates.append((fx, fy, 0.0, per_area, parent_id,
                                     int(cx), int(cy), quality_penalty,
-                                    len(sub_centers), c))
+                                    len(sub_centers), c, appearance))
 
         candidates.sort(key=lambda b: -b[3])
 
@@ -1189,7 +1205,7 @@ class RobotTracker:
             new_static: dict = {}
             new_static_positions: dict = {}
             for entry in candidates:
-                fx, fy, hdg, _a, pid, cx, cy, qual, nsplit, cnt = entry
+                fx, fy, hdg, _a, pid, cx, cy, qual, nsplit, cnt, appearance = entry
                 # Bucket this centroid to a coarse grid for history lookup
                 key = (round(cx / self.STATIC_BLOB_MOVE_PX),
                        round(cy / self.STATIC_BLOB_MOVE_PX))
@@ -1224,8 +1240,8 @@ class RobotTracker:
             self._blob_static_positions = {}
         # ── end static blob suppression ─────────────────────────────────────
 
-        return [(fx, fy, hdg, pid, cx, cy, qual, nsplit, cnt)
-                for fx, fy, hdg, _a, pid, cx, cy, qual, nsplit, cnt in candidates]
+        return [(fx, fy, hdg, pid, cx, cy, qual, nsplit, cnt, appearance)
+                for fx, fy, hdg, _a, pid, cx, cy, qual, nsplit, cnt, appearance in candidates]
 
     def _augment_subcenters_with_track_priors(self, contour, centers):
         expected = self._expected_robot_count(float(self.cv2.contourArea(contour)))
@@ -1264,6 +1280,69 @@ class RobotTracker:
         if split_count == 1 and area > robot_area * 1.8:
             penalty += min((area / robot_area) - 1.8, 2.0) * 0.7
         return penalty
+
+    def _extract_appearance_feature(self, frame, cx: int, cy: int, contour=None):
+        cv2, np = self.cv2, self.np
+        if frame is None:
+            return None
+
+        radius = max(6, int(round(self._robot_max_px * self.REID_CROP_SCALE)))
+        x0 = max(0, int(cx) - radius)
+        y0 = max(0, int(cy) - radius)
+        x1 = min(frame.shape[1], int(cx) + radius + 1)
+        y1 = min(frame.shape[0], int(cy) + radius + 1)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return None
+
+        crop = frame[y0:y1, x0:x1]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        cv2.circle(mask, (int(cx) - x0, int(cy) - y0), max(3, radius - 1), 255, -1)
+        if contour is not None:
+            shifted = contour.copy()
+            shifted[:, 0, 0] -= x0
+            shifted[:, 0, 1] -= y0
+            contour_mask = np.zeros_like(mask)
+            cv2.drawContours(contour_mask, [shifted], -1, 255, -1)
+            mask = cv2.bitwise_and(mask, contour_mask)
+
+        hist = cv2.calcHist(
+            [hsv], [0, 1], mask,
+            [self.REID_HIST_H_BINS, self.REID_HIST_S_BINS],
+            [0, 180, 0, 256],
+        )
+        if hist is None:
+            return None
+        hist = hist.astype(np.float32)
+        total = float(hist.sum())
+        if total <= 0.0:
+            return None
+        hist /= total
+        return hist
+
+    def _appearance_cost(self, track_id: int, blob) -> float:
+        if len(blob) < 10 or blob[9] is None:
+            return 0.0
+        return self._appearance_cost_for_feature(track_id, blob[9])
+
+    def _appearance_cost_for_feature(self, track_id: int, feature) -> float:
+        if not self._reid_refs or track_id not in self._reid_refs or feature is None:
+            return 0.0
+
+        refs = self._reid_refs.get(track_id) or []
+        if not refs:
+            return 0.0
+
+        cv2 = self.cv2
+        best = 1.0
+        for ref in refs:
+            d = float(cv2.compareHist(feature, ref, cv2.HISTCMP_BHATTACHARYYA))
+            if d < best:
+                best = d
+        return best
+
+    def set_reid_reference_histograms(self, refs: Dict[int, List]) -> None:
+        self._reid_refs = refs if refs else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1310,6 +1389,69 @@ def _project_image_points(cv2, np, H_2d, points_px):
     pts = np.array([points_px], dtype=np.float32)
     field = cv2.perspectiveTransform(pts, H_2d)[0]
     return [(float(p[0]), float(p[1])) for p in field]
+
+
+def _load_manual_pose_rows(csv_path: str):
+    rows = []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    return rows
+
+
+def _build_manual_reid_histograms(
+    tracker,
+    cap,
+    manual_reference_csv: str,
+    H_inv,
+    video_fps: float,
+):
+    cv2, np = tracker.cv2, tracker.np
+    rows = _load_manual_pose_rows(manual_reference_csv)
+    if not rows:
+        print("[WARN] Manual re-ID reference CSV is empty: {}".format(manual_reference_csv))
+        return None
+
+    refs = {i: [] for i in range(4)}
+    max_samples = tracker.REID_MAX_SAMPLES_PER_ROBOT
+    stride = max(1, tracker.REID_SAMPLE_STRIDE)
+
+    for row_idx in range(0, len(rows), stride):
+        row = rows[row_idx]
+        frame_num = int(round(float(row["timestamp_s"]) * video_fps))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        for robot_id in range(4):
+            if row["robot{}_visible".format(robot_id)] != "1":
+                continue
+            if len(refs[robot_id]) >= max_samples:
+                continue
+
+            fx = float(row["robot{}_x_in".format(robot_id)])
+            fy = float(row["robot{}_y_in".format(robot_id)])
+            pt = np.array([[[fx, fy]]], dtype=np.float32)
+            ip = cv2.perspectiveTransform(pt, H_inv)[0][0]
+            hist = tracker._extract_appearance_feature(
+                frame, int(round(float(ip[0]))), int(round(float(ip[1]))))
+            if hist is not None:
+                refs[robot_id].append(hist)
+
+        if all(len(refs[i]) >= max_samples for i in range(4)):
+            break
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    counts = [len(refs[i]) for i in range(4)]
+    if not any(counts):
+        print("[WARN] Could not build manual re-ID appearance references.")
+        return None
+
+    print("[INFO] Manual re-ID samples per robot: {}".format(counts))
+    return refs
 
 
 def _detect_robot_edge_profile(cv2, np, frame, fg_mask, tracker, center_px):
@@ -1538,6 +1680,7 @@ def process_match(
     debug_enable_hitboxes = False,
     manual_corners_px = None,
     robot_init_positions = None,  # list of 4 [x_in, y_in] field coords sorted by robot id
+    manual_reference_csv = None,
 ):
     cv2 = _require("cv2", "opencv-python")
     np  = _require("numpy")
@@ -1635,6 +1778,18 @@ def process_match(
         tracker._initialized = True
         print("[INFO] Tracker force-initialized with {} robots.".format(
             len(robot_init_positions[:4])))
+
+    if manual_reference_csv is not None and H_inv is not None:
+        refs = _build_manual_reid_histograms(
+            tracker=tracker,
+            cap=cap,
+            manual_reference_csv=manual_reference_csv,
+            H_inv=H_inv,
+            video_fps=video_fps,
+        )
+        if refs:
+            tracker.set_reid_reference_histograms(refs)
+            print("[INFO] Manual re-ID appearance model enabled.")
 
     frame_num = start_frame; processed = 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame if start_frame > 0 else 0)
@@ -1899,6 +2054,13 @@ def main():
                        "corner structures or are otherwise hard to detect at t=0). "
                        "Example: --robot-init-positions "
                        "'[[19.3,1.6],[59.4,125.0],[87.8,132.6],[129.5,16.3]]'"))
+    p.add_argument("--manual-reference-csv", default=None,
+                   help=(
+                       "Manual robot_positions-style CSV used to build a supervised "
+                       "appearance re-ID model for this video. "
+                       "Useful for tuning tracker identity assignment against "
+                       "hand-labeled data."
+                   ))
     args = p.parse_args()
 
     if args.no_download:
@@ -1938,6 +2100,7 @@ def main():
         debug_enable_hitboxes= args.debug_enable_hitboxes,
         manual_corners_px    = corners,
         robot_init_positions = robot_init,
+        manual_reference_csv = args.manual_reference_csv,
     )
 
 

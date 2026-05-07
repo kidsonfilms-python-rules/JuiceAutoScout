@@ -1,4 +1,6 @@
-# FIRST Tech Challenge Automatic Scouter
+![Project Header Image](assets/Project-REDACTED-Header.png)
+
+# *FIRST* Tech Challenge Automatic Scouter
 | Internal Codename | **Project REDACTED** |
 | -------- | -------- |
 | rayID Designation | RE-016236-08 |
@@ -12,6 +14,13 @@ Current outputs are focused on robot motion:
 - `robot_positions.csv` for per-timestamp robot poses and visibility
 - `match_log.wpilog` for AdvantageScope playback
 - optional annotated debug frames in `output/tracker_debug/`
+
+Output coordinates now use a center-origin field frame:
+
+- `(0, 0)` is the center of the 144 inch x 144 inch field
+- `x` increases to the right
+- `y` increases downward in the projected field plane used by the tracker
+- the field corners are approximately `(-72, -72)` to `(72, 72)` in inches
 
 ## Requirements
 Install the runtime dependencies:
@@ -47,6 +56,8 @@ python3 auto_scout.py "https://www.youtube.com/watch?v=..."
 | `--no-download` | - | disabled | Use a local video instead of downloading from YouTube |
 | `--video-path` | `string` | `None` | Path to the local match video. Requires `--no-download` |
 | `--corners` | `string` | `None` | Path to `field_corners.json` from `calibrate.py` |
+| `--robot-init-positions` | `json` | `None` | Four starting field coordinates in inches, using center-origin coordinates |
+| `--manual-reference-csv` | `string` | `None` | Manual `robot_positions`-style CSV in the same center-origin coordinate system |
 
 ## Field Calibration
 AutoScout can try to detect the field outline automatically, but manual calibration is more reliable.
@@ -63,9 +74,9 @@ That produces a `field_corners.json` file. Pass it to `auto_scout.py` with `--co
 When a run finishes, the output directory typically contains:
 
 - `robot_positions.csv`
-  Flat table of timestamped robot positions, headings, and visibility flags.
+  Flat table of timestamped robot positions, headings, and visibility flags. `x/y` are in inches from field center.
 - `match_log.wpilog`
-  WPILOG output for AdvantageScope.
+  WPILOG output using the same center-origin coordinates, converted to meters.
 - `median_background.jpg`
   The median background image used for subtraction.
 - `tracker_debug/`

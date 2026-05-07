@@ -55,6 +55,8 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 
 SAVE_ALL_DEBUG_AROUND_MERGES = False
 PROCESS_EVERY_SOURCE_FRAME = True
+FIELD_SIZE_IN = 144.0
+FIELD_CENTER_OFFSET_IN = FIELD_SIZE_IN / 2.0
 
 
 def _require(package, pip_name=None):
@@ -87,6 +89,14 @@ def _make_bar(label, max_val):
             def finish(self):
                 print()
         return _FallbackBar(label, max_val)
+
+
+def _field_corner_to_center_xy(x_in: float, y_in: float) -> Tuple[float, float]:
+    return float(x_in) - FIELD_CENTER_OFFSET_IN, float(y_in) - FIELD_CENTER_OFFSET_IN
+
+
+def _field_center_to_corner_xy(x_in: float, y_in: float) -> Tuple[float, float]:
+    return float(x_in) + FIELD_CENTER_OFFSET_IN, float(y_in) + FIELD_CENTER_OFFSET_IN
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,16 +156,22 @@ class WPILogWriter:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class RobotPose:
-    x_in:    float = 0.0
-    y_in:    float = 0.0
+    x_in:    float = FIELD_CENTER_OFFSET_IN
+    y_in:    float = FIELD_CENTER_OFFSET_IN
     heading: float = 0.0
     visible: bool  = False
 
     @property
-    def x_m(self): return self.x_in * 0.0254
+    def x_center_in(self): return self.x_in - FIELD_CENTER_OFFSET_IN
 
     @property
-    def y_m(self): return self.y_in * 0.0254
+    def y_center_in(self): return self.y_in - FIELD_CENTER_OFFSET_IN
+
+    @property
+    def x_m(self): return self.x_center_in * 0.0254
+
+    @property
+    def y_m(self): return self.y_center_in * 0.0254
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +213,7 @@ class MergeGroup:
     current_order  : List[int]             = dc_field(default_factory=list)
     peak_assignment: dict                  = dc_field(default_factory=dict)
     order_votes    : dict                  = dc_field(default_factory=dict)
+    entry_features : dict                  = dc_field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,6 +265,9 @@ class RobotTracker:
     POST_MERGE_LOCK_FRAMES = 12
     POST_MERGE_LOCK_WEIGHT = 1.25
     POST_MERGE_LOCK_REJECT_PX = 115.0
+    POST_MERGE_LOCK_APPEAR_WEIGHT = 1.55
+    POST_MERGE_DUPLICATE_PX = 32.0
+    POST_MERGE_DUPLICATE_IN = 12.0
 
     def __init__(self, cv2, np):
         self.cv2, self.np = cv2, np
@@ -268,6 +288,7 @@ class RobotTracker:
         self._coast        = [999]  * 4
         self._merge_recent = [0]    * 4
         self._initialized  = False
+        self._track_features = [None] * 4
 
         self._merge_groups: Dict[FrozenSet, MergeGroup] = {}
         self._underresolved_tracks = set()
@@ -422,6 +443,8 @@ class RobotTracker:
                 else:
                     self._apply_separation(mg)
 
+        self._prune_post_merge_duplicate_assignments(blobs, assignment)
+
         # tracks inside a 2-robot merge have positions frozen (handled below)
         # tracks inside a 3+ robot merge get positions from peak_assignment
         two_merged_tracks = set()
@@ -458,6 +481,8 @@ class RobotTracker:
                 self.tracked_poses[i].visible = True
                 if i not in two_merged_tracks:
                     self._update_track_motion(i, (fx, fy), (cx, cy))
+                    feature = blobs[assignment[i]][9] if len(blobs[assignment[i]]) > 9 else None
+                    self._track_features[i] = feature
                     self._update_post_merge_lock(i, (fx, fy), (cx, cy))
                     self.tracked_poses[i].heading = self._motion_heading(
                         i, self.tracked_poses[i].heading)
@@ -490,7 +515,9 @@ class RobotTracker:
         lock["img_pos"] = (float(image_pos[0]), float(image_pos[1]))
         lock["field_pos"] = (float(field_pos[0]), float(field_pos[1]))
 
-    def _prime_post_merge_lock(self, track_id: int, field_pos, image_pos, prev_image_pos=None) -> None:
+    def _prime_post_merge_lock(self, track_id: int, field_pos, image_pos,
+                               prev_image_pos=None, feature=None,
+                               merge_group_key=None) -> None:
         prev_field = self._pos[track_id] if self._pos[track_id] is not None else field_pos
         if prev_image_pos is None:
             img_vel = (0.0, 0.0)
@@ -509,7 +536,71 @@ class RobotTracker:
             "img_vel": img_vel,
             "field_pos": (float(field_pos[0]), float(field_pos[1])),
             "field_vel": field_vel,
+            "feature": feature if feature is not None else self._track_features[track_id],
+            "merge_group_key": merge_group_key,
         }
+
+    def _assignment_support_cost(self, track_id: int, blob) -> float:
+        pred_field = self._predict_field_pos(track_id)
+        pred_px_x, pred_px_y = self._predict_image_pos(track_id)
+        d_field = math.hypot(float(blob[0]) - pred_field[0], float(blob[1]) - pred_field[1])
+        d_img = math.hypot(float(blob[4]) - pred_px_x, float(blob[5]) - pred_px_y)
+        cost = (
+            d_field / max(self.MAX_REACQ_IN, 1.0)
+            + 0.35 * d_img / max(self._robot_max_px * 1.25, 1.0)
+            + float(blob[6])
+            + self._appearance_cost(track_id, blob)
+        )
+        lock = self._post_merge_locks[track_id]
+        if lock is not None:
+            lock_img_x, lock_img_y = lock["img_pos"]
+            d_lock_img = math.hypot(float(blob[4]) - lock_img_x, float(blob[5]) - lock_img_y)
+            cost += self.POST_MERGE_LOCK_WEIGHT * (
+                d_lock_img / max(self._robot_max_px, 1.0))
+            cost += self.POST_MERGE_LOCK_APPEAR_WEIGHT * self._feature_distance(
+                lock.get("feature"),
+                blob[9] if len(blob) > 9 else None,
+            )
+        return cost
+
+    def _prune_post_merge_duplicate_assignments(self, blobs, assignment: Dict[int, int]) -> None:
+        if len(assignment) < 2:
+            return
+
+        removed = set()
+        assigned_tracks = list(assignment.keys())
+        for idx, tid_a in enumerate(assigned_tracks):
+            if tid_a in removed or tid_a not in assignment:
+                continue
+            lock_a = self._post_merge_locks[tid_a]
+            if lock_a is None or lock_a.get("merge_group_key") is None:
+                continue
+            blob_a = blobs[assignment[tid_a]]
+            for tid_b in assigned_tracks[idx + 1:]:
+                if tid_b in removed or tid_b not in assignment:
+                    continue
+                lock_b = self._post_merge_locks[tid_b]
+                if lock_b is None or lock_b.get("merge_group_key") != lock_a.get("merge_group_key"):
+                    continue
+                blob_b = blobs[assignment[tid_b]]
+                d_img = math.hypot(float(blob_a[4]) - float(blob_b[4]),
+                                   float(blob_a[5]) - float(blob_b[5]))
+                d_field = math.hypot(float(blob_a[0]) - float(blob_b[0]),
+                                     float(blob_a[1]) - float(blob_b[1]))
+                if d_img > self.POST_MERGE_DUPLICATE_PX or d_field > self.POST_MERGE_DUPLICATE_IN:
+                    continue
+
+                cost_a = self._assignment_support_cost(tid_a, blob_a)
+                cost_b = self._assignment_support_cost(tid_b, blob_b)
+                drop_tid = tid_a if cost_a > cost_b else tid_b
+                removed.add(drop_tid)
+
+        for tid in removed:
+            del assignment[tid]
+            self._post_merge_locks[tid] = None
+            self._coast[tid] = self.VISIBLE_COAST
+            self.tracked_poses[tid].visible = False
+            print("[INFO] Pruned duplicate post-merge track: R{}".format(tid))
 
     def _initialize_tracks_from_lineup(self, lineup, reason: str):
         for i, (fx, fy, cx, cy) in enumerate(lineup):
@@ -576,8 +667,10 @@ class RobotTracker:
                     d_lock_img = math.hypot(b[4] - lock_img_x, b[5] - lock_img_y)
                     if d_lock_img > self.POST_MERGE_LOCK_REJECT_PX:
                         continue
+                    lock_feature_cost = self._feature_distance(lock.get("feature"), b[9] if len(b) > 9 else None)
                 else:
                     d_lock_img = 0.0
+                    lock_feature_cost = 0.0
                 dist_scale = (self.MAX_REACQ_IN
                               if self._coast[i] > self.VISIBLE_COAST
                               else self.MAX_DIST_IN)
@@ -597,6 +690,7 @@ class RobotTracker:
                     + appearance_weight * appearance_cost
                     + self.POST_MERGE_LOCK_WEIGHT * (
                         d_lock_img / max(self._robot_max_px, 1.0))
+                    + self.POST_MERGE_LOCK_APPEAR_WEIGHT * lock_feature_cost
                 )
 
         if n == 0:
@@ -767,6 +861,11 @@ class RobotTracker:
             tid: [0.0] * len(entry_order)
             for tid in track_ids
         }
+        entry_features = {
+            tid: self._track_features[tid]
+            for tid in track_ids
+            if self._track_features[tid] is not None
+        }
         for slot, tid in enumerate(entry_order):
             order_votes[tid][slot] += 1.0
 
@@ -779,6 +878,7 @@ class RobotTracker:
             current_order  = list(entry_order),   # starts as identity permutation
             peak_assignment= peak_assignment,
             order_votes    = order_votes,
+            entry_features = entry_features,
         )
 
     def _update_crossing(self, mg: MergeGroup, contour) -> None:
@@ -1069,6 +1169,7 @@ class RobotTracker:
         for tid in mg.track_ids:
             peak = mg.peak_assignment.get(tid)
             pred_field = self._predict_field_pos(tid)
+            entry_feature = mg.entry_features.get(tid, self._track_features[tid])
             per_track = []
             for bi, blob in enumerate(blobs):
                 d_peak = 0.0
@@ -1076,10 +1177,12 @@ class RobotTracker:
                     d_peak = math.hypot(float(blob[4]) - peak[0], float(blob[5]) - peak[1])
                 d_field = math.hypot(float(blob[0]) - pred_field[0], float(blob[1]) - pred_field[1])
                 appearance_cost = self._appearance_cost(tid, blob)
+                entry_feature_cost = self._feature_distance(entry_feature, blob[9] if len(blob) > 9 else None)
                 per_track.append((
                     d_peak / max(self._robot_max_px, 1.0)
                     + 0.6 * d_field / max(self.MAX_REACQ_IN, 1.0)
-                    + 1.4 * appearance_cost,
+                    + 1.4 * appearance_cost
+                    + 1.1 * entry_feature_cost,
                     bi,
                 ))
             per_track.sort()
@@ -1106,6 +1209,11 @@ class RobotTracker:
                 d_img = math.hypot(float(blob[4]) - peak[0], float(blob[5]) - peak[1])
                 d_field = math.hypot(float(blob[0]) - pred_field[0], float(blob[1]) - pred_field[1])
                 appearance_cost = self._appearance_cost(tid, blob)
+                entry_feature = mg.entry_features.get(tid, self._track_features[tid])
+                entry_feature_cost = self._feature_distance(
+                    entry_feature,
+                    blob[9] if len(blob) > 9 else None,
+                )
                 slot_penalty = abs(slot - slot_for_tid[tid])
                 lock = self._post_merge_locks[tid]
                 if lock is not None:
@@ -1118,6 +1226,7 @@ class RobotTracker:
                     d_img / max(self._robot_max_px, 1.0)
                     + 0.55 * d_field / max(self.MAX_DIST_IN, 1.0)
                     + 1.9 * appearance_cost
+                    + 1.35 * entry_feature_cost
                     + 0.65 * slot_penalty
                     + 0.8 * d_lock / max(self._robot_max_px, 1.0)
                 )
@@ -1144,11 +1253,15 @@ class RobotTracker:
             assignment[tid] = bi
             fx, fy = float(blobs[bi][0]), float(blobs[bi][1])
             cx, cy = float(blobs[bi][4]), float(blobs[bi][5])
+            feature = blobs[bi][9] if len(blobs[bi]) > 9 else None
+            self._track_features[tid] = feature
             self._prime_post_merge_lock(
                 tid,
                 (fx, fy),
                 (cx, cy),
                 prev_image_pos=mg.peak_assignment.get(tid),
+                feature=feature,
+                merge_group_key=tuple(sorted(mg.track_ids)),
             )
 
         swaps = []
@@ -1564,6 +1677,11 @@ class RobotTracker:
             return 0.0
         return self._appearance_cost_for_feature(track_id, blob[9])
 
+    def _feature_distance(self, feature_a, feature_b) -> float:
+        if feature_a is None or feature_b is None:
+            return 0.0
+        return float(self.cv2.compareHist(feature_a, feature_b, self.cv2.HISTCMP_BHATTACHARYYA))
+
     def _appearance_cost_for_feature(self, track_id: int, feature) -> float:
         if not self._reid_refs or track_id not in self._reid_refs or feature is None:
             return 0.0
@@ -1670,8 +1788,9 @@ def _build_manual_reid_histograms(
             if len(refs[robot_id]) >= max_samples:
                 continue
 
-            fx = float(row["robot{}_x_in".format(robot_id)])
-            fy = float(row["robot{}_y_in".format(robot_id)])
+            fx_center = float(row["robot{}_x_in".format(robot_id)])
+            fy_center = float(row["robot{}_y_in".format(robot_id)])
+            fx, fy = _field_center_to_corner_xy(fx_center, fy_center)
             pt = np.array([[[fx, fy]]], dtype=np.float32)
             ip = cv2.perspectiveTransform(pt, H_inv)[0][0]
             hist = tracker._extract_appearance_feature(
@@ -1918,7 +2037,7 @@ def process_match(
     debug_every_n     = 10,
     debug_enable_hitboxes = False,
     manual_corners_px = None,
-    robot_init_positions = None,  # list of 4 [x_in, y_in] field coords sorted by robot id
+    robot_init_positions = None,  # list of 4 [x_in, y_in] center-origin field coords sorted by robot id
     manual_reference_csv = None,
 ):
     cv2 = _require("cv2", "opencv-python")
@@ -2001,7 +2120,8 @@ def process_match(
     # --- Manual robot initialization (bypasses blob-based init) ---
     if robot_init_positions is not None and H_inv is not None:
         print("[INFO] Using manual robot init positions — bypassing blob-based init.")
-        for i, (fx, fy) in enumerate(robot_init_positions[:4]):
+        for i, (fx_center, fy_center) in enumerate(robot_init_positions[:4]):
+            fx, fy = _field_center_to_corner_xy(fx_center, fy_center)
             pt = np.array([[[float(fx), float(fy)]]], np.float32)
             ip = cv2.perspectiveTransform(pt, H_inv)[0][0]
             cx, cy = float(ip[0]), float(ip[1])
@@ -2012,8 +2132,8 @@ def process_match(
             tracker.tracked_poses[i].y_in    = fy
             tracker.tracked_poses[i].heading = 0.0
             tracker.tracked_poses[i].visible = True
-            print("[INFO]   Robot{}: field=({:.1f},{:.1f}) pixel=({:.0f},{:.0f})".format(
-                i, fx, fy, cx, cy))
+            print("[INFO]   Robot{}: field_center=({:.1f},{:.1f}) pixel=({:.0f},{:.0f})".format(
+                i, fx_center, fy_center, cx, cy))
         tracker._initialized = True
         print("[INFO] Tracker force-initialized with {} robots.".format(
             len(robot_init_positions[:4])))
@@ -2084,7 +2204,7 @@ def process_match(
 
         row = ["{:.4f}".format(match_time_s)]
         for p in poses:
-            row += ["{:.2f}".format(p.x_in), "{:.2f}".format(p.y_in),
+            row += ["{:.2f}".format(p.x_center_in), "{:.2f}".format(p.y_center_in),
                     "{:.4f}".format(p.heading), "1" if p.visible else "0"]
         csv_writer.writerow(row)
 
@@ -2288,15 +2408,17 @@ def main():
                    help=(
                        "JSON file or inline JSON string with starting field positions "
                        "for all 4 robots, sorted by robot id. "
-                       "Format: [[x0,y0],[x1,y1],[x2,y2],[x3,y3]] in inches. "
+                       "Format: [[x0,y0],[x1,y1],[x2,y2],[x3,y3]] in inches "
+                       "with (0,0) at field center. "
                        "Bypasses blob-based init (required when robots start under "
                        "corner structures or are otherwise hard to detect at t=0). "
                        "Example: --robot-init-positions "
-                       "'[[19.3,1.6],[59.4,125.0],[87.8,132.6],[129.5,16.3]]'"))
+                       "'[[-52.7,-70.4],[-12.6,53.0],[15.8,60.6],[57.5,-55.7]]'"))
     p.add_argument("--manual-reference-csv", default=None,
                    help=(
                        "Manual robot_positions-style CSV used to build a supervised "
                        "appearance re-ID model for this video. "
+                       "CSV coordinates are interpreted with (0,0) at field center. "
                        "Useful for tuning tracker identity assignment against "
                        "hand-labeled data."
                    ))

@@ -446,12 +446,12 @@
           <div class="section-title">Pose</div>
           <div class="row">
             <div class="field">
-              <label for="xIn">X inches</label>
-              <input id="xIn" type="number" step="0.01" min="0" max="144">
+              <label for="xIn">X inches (center)</label>
+              <input id="xIn" type="number" step="0.01" min="-72" max="72">
             </div>
             <div class="field">
-              <label for="yIn">Y inches</label>
-              <input id="yIn" type="number" step="0.01" min="0" max="144">
+              <label for="yIn">Y inches (center)</label>
+              <input id="yIn" type="number" step="0.01" min="-72" max="72">
             </div>
           </div>
           <div class="row">
@@ -508,6 +508,9 @@
   <script>
     const ROBOT_COUNT = 4;
     const FIELD_SIZE_IN = 144;
+    const FIELD_HALF_IN = FIELD_SIZE_IN / 2;
+    const FIELD_MIN_IN = -FIELD_HALF_IN;
+    const FIELD_MAX_IN = FIELD_HALF_IN;
     const COLORS = ["#49b6ff", "#ff9626", "#ff735d", "#56d58a"];
     const state = {
       selectedRobot: 0,
@@ -756,8 +759,8 @@
         const existing = sampleRobotAtTime(state.selectedRobot, els.video.currentTime, true);
         state.currentPose = existing || {
           t: els.video.currentTime || 0,
-          xIn: FIELD_SIZE_IN / 2,
-          yIn: FIELD_SIZE_IN / 2,
+          xIn: 0,
+          yIn: 0,
           xPx: null,
           yPx: null,
           heading: 0,
@@ -800,8 +803,8 @@
       const xIn = Number(els.xIn.value);
       const yIn = Number(els.yIn.value);
       const heading = Number(els.headingRad.value);
-      if (Number.isFinite(xIn)) state.currentPose.xIn = clamp(xIn, 0, FIELD_SIZE_IN);
-      if (Number.isFinite(yIn)) state.currentPose.yIn = clamp(yIn, 0, FIELD_SIZE_IN);
+      if (Number.isFinite(xIn)) state.currentPose.xIn = clamp(xIn, FIELD_MIN_IN, FIELD_MAX_IN);
+      if (Number.isFinite(yIn)) state.currentPose.yIn = clamp(yIn, FIELD_MIN_IN, FIELD_MAX_IN);
       if (Number.isFinite(heading)) state.currentPose.heading = normalizeAngle(heading);
       const px = fieldToImage(state.currentPose.xIn, state.currentPose.yIn);
       state.currentPose.xPx = px ? px.x : null;
@@ -812,8 +815,8 @@
     function nudge(dx, dy) {
       ensurePose();
       const step = 1;
-      state.currentPose.xIn = clamp(state.currentPose.xIn + dx * step, 0, FIELD_SIZE_IN);
-      state.currentPose.yIn = clamp(state.currentPose.yIn + dy * step, 0, FIELD_SIZE_IN);
+      state.currentPose.xIn = clamp(state.currentPose.xIn + dx * step, FIELD_MIN_IN, FIELD_MAX_IN);
+      state.currentPose.yIn = clamp(state.currentPose.yIn + dy * step, FIELD_MIN_IN, FIELD_MAX_IN);
       const px = fieldToImage(state.currentPose.xIn, state.currentPose.yIn);
       state.currentPose.xPx = px ? px.x : state.currentPose.xPx;
       state.currentPose.yPx = px ? px.y : state.currentPose.yPx;
@@ -830,8 +833,8 @@
       const t = Number(els.video.currentTime || 0);
       const pose = {
         t,
-        xIn: clamp(Number(state.currentPose.xIn) || 0, 0, FIELD_SIZE_IN),
-        yIn: clamp(Number(state.currentPose.yIn) || 0, 0, FIELD_SIZE_IN),
+        xIn: clamp(Number(state.currentPose.xIn) || 0, FIELD_MIN_IN, FIELD_MAX_IN),
+        yIn: clamp(Number(state.currentPose.yIn) || 0, FIELD_MIN_IN, FIELD_MAX_IN),
         xPx: Number.isFinite(state.currentPose.xPx) ? state.currentPose.xPx : null,
         yPx: Number.isFinite(state.currentPose.yPx) ? state.currentPose.yPx : null,
         heading: normalizeAngle(Number(state.currentPose.heading) || 0),
@@ -1008,6 +1011,7 @@
         },
         field: {
           sizeIn: FIELD_SIZE_IN,
+          origin: "center",
           cornersPx: state.corners
         },
         export: {
@@ -1029,12 +1033,13 @@
       if (session.field?.cornersPx) {
         setCorners(parseCorners({ corners_px: session.field.cornersPx }));
       }
+      const sessionOrigin = session.field?.origin === "center" ? "center" : "corner";
       if (Array.isArray(session.robots)) {
         const next = Array.from({ length: ROBOT_COUNT }, () => []);
         session.robots.forEach((robotItem, fallbackIndex) => {
           const robot = Number.isInteger(robotItem.robot) ? robotItem.robot : fallbackIndex;
           if (robot < 0 || robot >= ROBOT_COUNT || !Array.isArray(robotItem.labels)) return;
-          next[robot] = robotItem.labels.map(cleanLabel).filter(Boolean).sort((a, b) => a.t - b.t);
+          next[robot] = robotItem.labels.map((label) => cleanLabel(label, sessionOrigin)).filter(Boolean).sort((a, b) => a.t - b.t);
         });
         state.labels = next;
       }
@@ -1049,16 +1054,20 @@
       updateStatus();
     }
 
-    function cleanLabel(label) {
+    function cleanLabel(label, origin = "center") {
       const t = Number(label.t);
-      const xIn = Number(label.xIn);
-      const yIn = Number(label.yIn);
+      let xIn = Number(label.xIn);
+      let yIn = Number(label.yIn);
       const heading = Number(label.heading);
       if (![t, xIn, yIn, heading].every(Number.isFinite)) return null;
+      if (origin === "corner") {
+        xIn -= FIELD_HALF_IN;
+        yIn -= FIELD_HALF_IN;
+      }
       return {
         t,
-        xIn: clamp(xIn, 0, FIELD_SIZE_IN),
-        yIn: clamp(yIn, 0, FIELD_SIZE_IN),
+        xIn: clamp(xIn, FIELD_MIN_IN, FIELD_MAX_IN),
+        yIn: clamp(yIn, FIELD_MIN_IN, FIELD_MAX_IN),
         xPx: Number.isFinite(Number(label.xPx)) ? Number(label.xPx) : null,
         yPx: Number.isFinite(Number(label.yPx)) ? Number(label.yPx) : null,
         heading: normalizeAngle(heading),
@@ -1096,12 +1105,15 @@
     function imageToField(x, y) {
       if (!state.homography) return { x: 0, y: 0 };
       const p = applyHomography(state.homography, x, y);
-      return { x: clamp(p.x, 0, FIELD_SIZE_IN), y: clamp(p.y, 0, FIELD_SIZE_IN) };
+      return {
+        x: clamp(p.x - FIELD_HALF_IN, FIELD_MIN_IN, FIELD_MAX_IN),
+        y: clamp(p.y - FIELD_HALF_IN, FIELD_MIN_IN, FIELD_MAX_IN)
+      };
     }
 
     function fieldToImage(x, y) {
       if (!state.inverseHomography) return null;
-      return applyHomography(state.inverseHomography, x, y);
+      return applyHomography(state.inverseHomography, x + FIELD_HALF_IN, y + FIELD_HALF_IN);
     }
 
     function findHomography(src, dst) {

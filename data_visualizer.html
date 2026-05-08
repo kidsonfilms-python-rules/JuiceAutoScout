@@ -1,0 +1,1526 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Data Visualizer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080808;
+      --panel: #131114;
+      --panel-2: #1a1712;
+      --line: #352a1f;
+      --muted: #ababab;
+      --text: #e2e2e2;
+      --accent: #fe8f00;
+      --accent-2: #ff9626;
+      --gold: #ffd24f;
+      --danger: #d95f45;
+      --green: #50dd75;
+      --red: #ff5d5d;
+      --neutral: #7eb8ff;
+      --r0: #49b6ff;
+      --r1: #ff9626;
+      --r2: #ff735d;
+      --r3: #56d58a;
+      font-family: Poppins, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .app {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      height: 100vh;
+      min-height: 0;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.2;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      min-height: 34px;
+      padding: 0 10px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: #6f4c1c;
+      background: #241b10;
+    }
+
+    button.primary {
+      background: #fe8f00;
+      border-color: #ffb24d;
+      color: #080808;
+      font-weight: 800;
+    }
+
+    input,
+    select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0f0f0f;
+      color: var(--text);
+      min-height: 34px;
+      padding: 6px 8px;
+    }
+
+    input[type="file"] {
+      padding: 5px 8px;
+    }
+
+    input[type="range"] {
+      padding: 0;
+      accent-color: var(--accent);
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(170px, auto) minmax(180px, 1.1fr) minmax(180px, 1fr) auto;
+      gap: 10px;
+      align-items: end;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(8, 8, 8, 0.9);
+      backdrop-filter: blur(5px);
+    }
+
+    .brand {
+      display: grid;
+      grid-template-columns: 112px minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      min-width: 0;
+      align-self: center;
+    }
+
+    .brand-logo {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .brand-logo img {
+      display: block;
+      width: 112px;
+      max-height: 40px;
+      object-fit: contain;
+    }
+
+    .brand-name {
+      font-size: 15px;
+      font-weight: 800;
+      line-height: 1.05;
+      color: var(--accent-2);
+      white-space: nowrap;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .brand-subtitle {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.1;
+      white-space: nowrap;
+    }
+
+    .field {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 1fr 360px;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .stage-shell {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: 1fr auto;
+      background: #050505;
+    }
+
+    .stage {
+      position: relative;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .field-shell {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      background: #050505;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+    }
+
+    .field-frame {
+      position: relative;
+      display: inline-block;
+      max-width: 100%;
+      max-height: 100%;
+      min-width: 320px;
+      min-height: 320px;
+    }
+
+    .field-image,
+    .overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    .field-image {
+      display: block;
+      transform-origin: center center;
+      object-fit: contain;
+      background: #050505;
+    }
+
+    .overlay {
+      overflow: visible;
+      pointer-events: none;
+    }
+
+    #overlay {
+      pointer-events: auto;
+    }
+
+    .overlay circle,
+    .overlay line,
+    .overlay rect,
+    .overlay polygon {
+      vector-effect: non-scaling-stroke;
+    }
+
+    .empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      padding: 24px;
+      color: #777a7e;
+      font-size: 15px;
+      letter-spacing: 0;
+      pointer-events: none;
+    }
+
+    .transport {
+      display: grid;
+      grid-template-columns: 1fr auto auto auto auto;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      background: #0f0f0f;
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .side {
+      min-height: 0;
+      overflow: auto;
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px;
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+
+    .lede {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .section {
+      display: grid;
+      gap: 10px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .section-title {
+      color: #e2e2e2;
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .robot-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .robot-chip {
+      display: grid;
+      grid-template-columns: auto auto 1fr;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0f0f0f;
+      font-size: 13px;
+    }
+
+    .robot-chip input,
+    .toggle input {
+      width: 18px;
+      min-height: 18px;
+      accent-color: var(--accent);
+    }
+
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+
+    .toggles,
+    .stats {
+      display: grid;
+      gap: 6px;
+    }
+
+    .toggle,
+    .stat-card,
+    .range-row {
+      display: grid;
+      align-items: center;
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0f0f0f;
+      font-size: 13px;
+    }
+
+    .toggle {
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+    }
+
+    .range-row {
+      gap: 8px;
+    }
+
+    .stat-card {
+      grid-template-columns: auto 1fr auto auto auto;
+      gap: 8px;
+    }
+
+    .stat-label {
+      font-weight: 700;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 48px;
+      min-height: 26px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      border: 1px solid var(--line);
+      font-weight: 700;
+    }
+
+    .pill.green {
+      background: rgba(80, 221, 117, 0.16);
+      color: var(--green);
+      border-color: rgba(80, 221, 117, 0.35);
+    }
+
+    .pill.red {
+      background: rgba(255, 93, 93, 0.14);
+      color: var(--red);
+      border-color: rgba(255, 93, 93, 0.30);
+    }
+
+    .pill.neutral {
+      background: rgba(126, 184, 255, 0.14);
+      color: var(--neutral);
+      border-color: rgba(126, 184, 255, 0.30);
+    }
+
+    .tooltip {
+      position: fixed;
+      z-index: 20;
+      pointer-events: none;
+      display: none;
+      min-width: 190px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: rgba(8, 8, 8, 0.96);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .tooltip strong {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 13px;
+    }
+
+    .credit {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .credit a {
+      color: var(--accent-2);
+    }
+
+    @media (max-width: 920px) {
+      .topbar {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .brand {
+        grid-column: 1 / -1;
+      }
+
+      .workspace {
+        grid-template-columns: 1fr;
+        overflow: auto;
+      }
+
+      .side {
+        border-left: 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .field-image {
+        max-height: 70vh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand" aria-label="Juice 16236 Data Visualizer">
+        <div class="brand-logo">
+          <img src="https://juicerobotics.org/assets/dark/logo.png" alt="Juice 16236 Logo">
+        </div>
+        <div>
+          <div class="brand-name">AutoScout</div>
+          <div class="brand-subtitle">Data Visualizer</div>
+        </div>
+      </div>
+      <div class="field">
+        <label for="csvFile">AutoScout CSV</label>
+        <input id="csvFile" type="file" accept=".csv,text/csv">
+      </div>
+      <div class="field">
+        <label for="imageUrl">Field image path</label>
+        <input id="imageUrl" type="text" value="assets/decode-field.png">
+      </div>
+      <button id="reloadImage" class="primary" type="button">Reload</button>
+    </header>
+
+    <main class="workspace">
+      <section class="stage-shell">
+        <div class="stage">
+          <div class="field-shell">
+            <div class="field-frame" id="fieldFrame">
+              <img id="fieldImage" class="field-image" alt="Juice FTC field">
+              <canvas id="heatmapLayer" class="overlay" aria-hidden="true"></canvas>
+              <svg id="overlay" class="overlay"></svg>
+              <div id="empty" class="empty">
+                Load a <code>robot_positions.csv</code> file to explore shot and position layers.
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="transport">
+          <div class="status" id="status">Load a CSV to begin.</div>
+          <div class="pill green">Made</div>
+          <div class="pill red">Missed</div>
+          <div class="pill neutral">Position</div>
+          <div class="pill" style="color: var(--gold); border-color: rgba(255, 210, 79, 0.35); background: rgba(255, 210, 79, 0.12);">SOTM</div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="section">
+          <div class="section-title">Overview</div>
+          <p class="lede">
+            Explore AutoScout match data as layered field overlays. Shots stay event-based, while positions can be rendered as trajectories, density, and static robot anchors.
+          </p>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Layers</div>
+          <div class="toggles">
+            <label class="toggle">
+              <span>Show shot layer</span>
+              <input id="showShotLayer" type="checkbox" checked>
+            </label>
+            <label class="toggle">
+              <span>Show position layer</span>
+              <input id="showPositionLayer" type="checkbox" checked>
+            </label>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Robots</div>
+          <div class="robot-grid" id="robotFilters"></div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Shots</div>
+          <div class="toggles">
+            <label class="toggle">
+              <span>Show made shots</span>
+              <input id="showMade" type="checkbox" checked>
+            </label>
+            <label class="toggle">
+              <span>Show missed shots</span>
+              <input id="showMissed" type="checkbox" checked>
+            </label>
+            <label class="toggle">
+              <span>Show robot labels</span>
+              <input id="showLabels" type="checkbox" checked>
+            </label>
+            <label class="toggle">
+              <span>Highlight Shoot on the Move</span>
+              <input id="showShootOnMove" type="checkbox" checked>
+            </label>
+          </div>
+          <div class="range-row">
+            <label for="dotSize">Shot marker size: <strong id="dotSizeValue">5</strong></label>
+            <input id="dotSize" type="range" min="4" max="18" step="1" value="5">
+          </div>
+          <div class="range-row">
+            <label for="shotMoveSpeed">SOTM speed min: <strong id="shotMoveSpeedValue">18</strong> in/s</label>
+            <input id="shotMoveSpeed" type="range" min="6" max="48" step="1" value="18">
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Positions</div>
+          <div class="toggles">
+            <label class="toggle">
+              <span>Plot trajectories</span>
+              <input id="showTrajectory" type="checkbox" checked>
+            </label>
+            <label class="toggle">
+              <span>Display heatmap</span>
+              <input id="showHeatmap" type="checkbox" checked>
+            </label>
+            <label class="toggle">
+              <span>Show centroid anchors</span>
+              <input id="showCentroids" type="checkbox" checked>
+            </label>
+            <label class="toggle">
+              <span>Show start/end markers</span>
+              <input id="showEndpoints" type="checkbox" checked>
+            </label>
+            <label class="toggle">
+              <span>Show sampled position dots</span>
+              <input id="showSamples" type="checkbox">
+            </label>
+          </div>
+          <div class="range-row">
+            <label for="heatRadius">Heat radius: <strong id="heatRadiusValue">11</strong></label>
+            <input id="heatRadius" type="range" min="10" max="48" step="1" value="11">
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Display</div>
+          <button id="rotateField" type="button">Rotate Field (90°)</button>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Summary</div>
+          <div class="stats" id="stats"></div>
+        </section>
+
+        <section class="section">
+          <div class="section-title">Notes</div>
+          <div class="credit">
+            Default background image: local asset at <code>assets/decode-field.png</code>.
+            Only the background image rotates; the plotted data remains in AutoScout's center-origin field frame with <code>x</code> and <code>y</code> spanning roughly <code>-72..72</code> inches.
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <div id="tooltip" class="tooltip"></div>
+
+  <script>
+    const ROBOT_COUNT = 4;
+    const FIELD_MIN = -72;
+    const FIELD_MAX = 72;
+    const FIELD_SPAN = FIELD_MAX - FIELD_MIN;
+    const RESOLVED_RESULTS = new Set(["made", "missed"]);
+
+    const state = {
+      shots: [],
+      positionsByRobot: Array.from({ length: ROBOT_COUNT }, () => []),
+      filters: {
+        robots: [true, true, true, true],
+        layers: {
+          shots: true,
+          positions: true,
+        },
+        shots: {
+          showMade: true,
+          showMissed: true,
+          showLabels: true,
+          showShootOnMove: true,
+          dotSize: 5,
+          shotMoveSpeed: 18,
+        },
+        positions: {
+          showTrajectory: true,
+          showHeatmap: true,
+          showCentroids: true,
+          showEndpoints: true,
+          showSamples: false,
+          heatRadius: 11,
+        },
+      },
+      rotationQuarterTurns: 1,
+    };
+
+    const els = {
+      csvFile: document.getElementById("csvFile"),
+      imageUrl: document.getElementById("imageUrl"),
+      reloadImage: document.getElementById("reloadImage"),
+      fieldImage: document.getElementById("fieldImage"),
+      fieldFrame: document.getElementById("fieldFrame"),
+      fieldShell: document.querySelector(".field-shell"),
+      heatmapLayer: document.getElementById("heatmapLayer"),
+      overlay: document.getElementById("overlay"),
+      empty: document.getElementById("empty"),
+      status: document.getElementById("status"),
+      stats: document.getElementById("stats"),
+      robotFilters: document.getElementById("robotFilters"),
+      showShotLayer: document.getElementById("showShotLayer"),
+      showPositionLayer: document.getElementById("showPositionLayer"),
+      showMade: document.getElementById("showMade"),
+      showMissed: document.getElementById("showMissed"),
+      showLabels: document.getElementById("showLabels"),
+      showShootOnMove: document.getElementById("showShootOnMove"),
+      showTrajectory: document.getElementById("showTrajectory"),
+      showHeatmap: document.getElementById("showHeatmap"),
+      showCentroids: document.getElementById("showCentroids"),
+      showEndpoints: document.getElementById("showEndpoints"),
+      showSamples: document.getElementById("showSamples"),
+      rotateField: document.getElementById("rotateField"),
+      dotSize: document.getElementById("dotSize"),
+      dotSizeValue: document.getElementById("dotSizeValue"),
+      shotMoveSpeed: document.getElementById("shotMoveSpeed"),
+      shotMoveSpeedValue: document.getElementById("shotMoveSpeedValue"),
+      heatRadius: document.getElementById("heatRadius"),
+      heatRadiusValue: document.getElementById("heatRadiusValue"),
+      tooltip: document.getElementById("tooltip"),
+    };
+
+    function cssVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function robotColor(index) {
+      return cssVar(["--r0", "--r1", "--r2", "--r3"][index]) || "#ffffff";
+    }
+
+    function rgba(color, alpha) {
+      const hex = color.trim();
+      if (!hex.startsWith("#")) return color;
+      const raw = hex.slice(1);
+      const sized = raw.length === 3 ? raw.split("").map((ch) => ch + ch).join("") : raw;
+      const int = Number.parseInt(sized, 16);
+      const r = (int >> 16) & 255;
+      const g = (int >> 8) & 255;
+      const b = int & 255;
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+
+    function initRobotFilters() {
+      els.robotFilters.innerHTML = "";
+      for (let i = 0; i < ROBOT_COUNT; i += 1) {
+        const label = document.createElement("label");
+        label.className = "robot-chip";
+        label.style.color = robotColor(i);
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = true;
+        checkbox.addEventListener("change", () => {
+          state.filters.robots[i] = checkbox.checked;
+          render();
+        });
+
+        const swatch = document.createElement("span");
+        swatch.className = "swatch";
+        swatch.style.background = robotColor(i);
+
+        const text = document.createElement("span");
+        text.textContent = `Robot ${i}`;
+
+        label.append(checkbox, swatch, text);
+        els.robotFilters.appendChild(label);
+      }
+    }
+
+    function setStatus(message) {
+      els.status.textContent = message;
+    }
+
+    function reloadImage() {
+      const raw = els.imageUrl.value.trim();
+      if (!raw) return;
+      try {
+        els.fieldImage.src = new URL(raw, window.location.href).href;
+      } catch (_error) {
+        els.fieldImage.src = raw;
+      }
+    }
+
+    function syncFrameSize() {
+      const img = els.fieldImage;
+      const frame = els.fieldFrame;
+      const shell = els.fieldShell;
+      const naturalW = img.naturalWidth || 0;
+      const naturalH = img.naturalHeight || 0;
+      if (!naturalW || !naturalH || !shell) return;
+
+      const turns = ((state.rotationQuarterTurns % 4) + 4) % 4;
+      const rotatedW = turns % 2 === 1 ? naturalH : naturalW;
+      const rotatedH = turns % 2 === 1 ? naturalW : naturalH;
+      const maxW = Math.max(1, shell.clientWidth - 32);
+      const maxH = Math.max(1, shell.clientHeight - 32);
+      const scale = Math.min(maxW / rotatedW, maxH / rotatedH, 1);
+      const frameW = Math.max(1, Math.round(rotatedW * scale));
+      const frameH = Math.max(1, Math.round(rotatedH * scale));
+
+      frame.style.width = `${frameW}px`;
+      frame.style.height = `${frameH}px`;
+
+      if (turns % 2 === 1) {
+        img.style.width = `${frameH}px`;
+        img.style.height = `${frameW}px`;
+      } else {
+        img.style.width = `${frameW}px`;
+        img.style.height = `${frameH}px`;
+      }
+      img.style.left = "50%";
+      img.style.top = "50%";
+      img.style.transform = `translate(-50%, -50%) rotate(${turns * 90}deg)`;
+    }
+
+    function parseCsv(text) {
+      const lines = text.replace(/\r/g, "").split("\n").filter(Boolean);
+      if (lines.length < 2) return [];
+      const header = splitCsvLine(lines[0]);
+      const rows = [];
+      for (let i = 1; i < lines.length; i += 1) {
+        const cells = splitCsvLine(lines[i]);
+        const row = {};
+        header.forEach((key, idx) => {
+          row[key] = cells[idx] ?? "";
+        });
+        rows.push(row);
+      }
+      return rows;
+    }
+
+    function splitCsvLine(line) {
+      const cells = [];
+      let current = "";
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i += 1) {
+        const ch = line[i];
+        if (ch === "\"") {
+          if (inQuotes && line[i + 1] === "\"") {
+            current += "\"";
+            i += 1;
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (ch === "," && !inQuotes) {
+          cells.push(current);
+          current = "";
+        } else {
+          current += ch;
+        }
+      }
+      cells.push(current);
+      return cells;
+    }
+
+    function extractShots(rows) {
+      const shots = [];
+      rows.forEach((row, rowIndex) => {
+        const timestamp = Number(row.timestamp_s);
+        for (let robot = 0; robot < ROBOT_COUNT; robot += 1) {
+          const result = (row[`robot${robot}_shot_result`] || "").trim().toLowerCase();
+          if (!RESOLVED_RESULTS.has(result)) continue;
+          const x = Number(row[`robot${robot}_shot_x_in`]);
+          const y = Number(row[`robot${robot}_shot_y_in`]);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+          shots.push({
+            robot,
+            result,
+            x,
+            y,
+            goal: (row[`robot${robot}_shot_goal`] || "").trim(),
+            timestamp,
+            rowIndex,
+          });
+        }
+      });
+      return dedupeShots(shots);
+    }
+
+    function annotateShotsWithMotion(shots, positionsByRobot) {
+      return shots.map((shot) => ({
+        ...shot,
+        speedInPerS: estimateShotSpeed(positionsByRobot[shot.robot] || [], shot.timestamp),
+      }));
+    }
+
+    function estimateShotSpeed(samples, timestamp) {
+      if (!Number.isFinite(timestamp) || samples.length < 2) return null;
+
+      let prev = null;
+      let next = null;
+      for (let i = 0; i < samples.length; i += 1) {
+        const sample = samples[i];
+        if (!Number.isFinite(sample.timestamp)) continue;
+        if (sample.timestamp <= timestamp) {
+          prev = sample;
+          continue;
+        }
+        next = sample;
+        break;
+      }
+
+      let a = prev;
+      let b = next;
+      if (!a || !b) {
+        let nearestIndex = -1;
+        let nearestDelta = Infinity;
+        for (let i = 0; i < samples.length; i += 1) {
+          const sample = samples[i];
+          if (!Number.isFinite(sample.timestamp)) continue;
+          const delta = Math.abs(sample.timestamp - timestamp);
+          if (delta < nearestDelta) {
+            nearestDelta = delta;
+            nearestIndex = i;
+          }
+        }
+        if (nearestIndex < 0) return null;
+        if (nearestIndex === 0) {
+          a = samples[0];
+          b = samples[1];
+        } else if (nearestIndex >= samples.length - 1) {
+          a = samples[samples.length - 2];
+          b = samples[samples.length - 1];
+        } else {
+          a = samples[nearestIndex - 1];
+          b = samples[nearestIndex + 1];
+        }
+      }
+
+      if (!a || !b) return null;
+      const dt = Math.abs(b.timestamp - a.timestamp);
+      if (!Number.isFinite(dt) || dt <= 1e-6) return null;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      return Math.hypot(dx, dy) / dt;
+    }
+
+    function extractPositions(rows) {
+      const positions = Array.from({ length: ROBOT_COUNT }, () => []);
+      rows.forEach((row, rowIndex) => {
+        const timestamp = Number(row.timestamp_s);
+        for (let robot = 0; robot < ROBOT_COUNT; robot += 1) {
+          const x = Number(row[`robot${robot}_x_in`]);
+          const y = Number(row[`robot${robot}_y_in`]);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+          const visible = parseVisible(row[`robot${robot}_visible`]);
+          if (visible === false) continue;
+          positions[robot].push({ robot, x, y, timestamp, rowIndex });
+        }
+      });
+      return positions;
+    }
+
+    function parseVisible(value) {
+      const normalized = String(value ?? "").trim().toLowerCase();
+      if (!normalized) return null;
+      if (["1", "true", "yes", "y"].includes(normalized)) return true;
+      if (["0", "false", "no", "n"].includes(normalized)) return false;
+      return null;
+    }
+
+    function dedupeShots(shots) {
+      const seen = new Set();
+      return shots.filter((shot) => {
+        const key = [
+          shot.robot,
+          shot.result,
+          shot.goal,
+          finiteKey(shot.timestamp),
+          shot.x.toFixed(2),
+          shot.y.toFixed(2),
+        ].join("|");
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+
+    function finiteKey(value) {
+      return Number.isFinite(value) ? value.toFixed(4) : "na";
+    }
+
+    function filteredShots() {
+      if (!state.filters.layers.shots) return [];
+      return state.shots.filter((shot) => {
+        if (!state.filters.robots[shot.robot]) return false;
+        if (shot.result === "made" && !state.filters.shots.showMade) return false;
+        if (shot.result === "missed" && !state.filters.shots.showMissed) return false;
+        return true;
+      });
+    }
+
+    function isShootOnMove(shot) {
+      return shot.result === "made"
+        && Number.isFinite(shot.speedInPerS)
+        && shot.speedInPerS >= state.filters.shots.shotMoveSpeed;
+    }
+
+    function filteredPositionsByRobot() {
+      if (!state.filters.layers.positions) {
+        return Array.from({ length: ROBOT_COUNT }, () => []);
+      }
+      return state.positionsByRobot.map((samples, robot) => (
+        state.filters.robots[robot] ? samples : []
+      ));
+    }
+
+    function fieldToImageX(x, width) {
+      return ((x - FIELD_MIN) / FIELD_SPAN) * width;
+    }
+
+    function fieldToImageY(y, height) {
+      return ((y - FIELD_MIN) / FIELD_SPAN) * height;
+    }
+
+    function updateRotationButton() {
+      const deg = ((state.rotationQuarterTurns % 4) + 4) % 4 * 90;
+      els.rotateField.textContent = `Rotate Field (${deg}°)`;
+    }
+
+    function totalPositionSamples(positionsByRobot) {
+      return positionsByRobot.reduce((sum, samples) => sum + samples.length, 0);
+    }
+
+    function hasPositionVisualsEnabled() {
+      const filters = state.filters.positions;
+      return filters.showTrajectory || filters.showHeatmap || filters.showCentroids || filters.showEndpoints || filters.showSamples;
+    }
+
+    function visibleElementCount(visibleShots, visiblePositionsByRobot) {
+      return visibleShots.length + totalPositionSamples(visiblePositionsByRobot);
+    }
+
+    function render() {
+      syncFrameSize();
+
+      const visibleShots = filteredShots();
+      const visiblePositionsByRobot = filteredPositionsByRobot();
+      const loadedShotCount = state.shots.length;
+      const loadedPositionCount = totalPositionSamples(state.positionsByRobot);
+      const hasLoadedData = loadedShotCount > 0 || loadedPositionCount > 0;
+      const positionVisualsEnabled = hasPositionVisualsEnabled();
+
+      renderStats(visibleShots, visiblePositionsByRobot);
+      renderHeatmap(visiblePositionsByRobot);
+      renderOverlay(visibleShots, visiblePositionsByRobot);
+
+      if (!hasLoadedData) {
+        els.empty.style.display = "grid";
+        els.empty.textContent = "Load a robot_positions.csv file to explore shots and positions.";
+        setStatus("Load a CSV to begin.");
+        return;
+      }
+
+      const shotLayerActive = state.filters.layers.shots && (state.filters.shots.showMade || state.filters.shots.showMissed);
+      const positionLayerActive = state.filters.layers.positions && positionVisualsEnabled;
+      if (!shotLayerActive && !positionLayerActive) {
+        els.empty.style.display = "grid";
+        els.empty.textContent = "Turn on at least one visible layer mode to render data.";
+        setStatus("No active layer visuals are enabled.");
+        return;
+      }
+
+      const visiblePositions = totalPositionSamples(visiblePositionsByRobot);
+      const totalVisible = visibleElementCount(visibleShots, visiblePositionsByRobot);
+      if (!totalVisible) {
+        els.empty.style.display = "grid";
+        els.empty.textContent = "No data matches the current filters.";
+      } else {
+        els.empty.style.display = "none";
+        els.empty.textContent = "";
+      }
+
+      setStatus(`Showing ${visibleShots.length} shot events and ${visiblePositions} position samples from ${loadedShotCount} shots and ${loadedPositionCount} positions.`);
+    }
+
+    function renderStats(visibleShots, visiblePositionsByRobot) {
+      const perRobot = Array.from({ length: ROBOT_COUNT }, () => ({ made: 0, missed: 0, positions: 0 }));
+      visibleShots.forEach((shot) => {
+        perRobot[shot.robot][shot.result] += 1;
+      });
+      visiblePositionsByRobot.forEach((samples, robot) => {
+        perRobot[robot].positions = samples.length;
+      });
+
+      els.stats.innerHTML = "";
+      perRobot.forEach((counts, robot) => {
+        const card = document.createElement("div");
+        card.className = "stat-card";
+
+        const swatch = document.createElement("span");
+        swatch.className = "swatch";
+        swatch.style.background = robotColor(robot);
+
+        const label = document.createElement("div");
+        label.className = "stat-label";
+        label.textContent = `Robot ${robot}`;
+
+        const made = document.createElement("div");
+        made.className = "pill green";
+        made.textContent = `M ${counts.made}`;
+
+        const missed = document.createElement("div");
+        missed.className = "pill red";
+        missed.textContent = `X ${counts.missed}`;
+
+        const positions = document.createElement("div");
+        positions.className = "pill neutral";
+        positions.textContent = `P ${counts.positions}`;
+
+        card.append(swatch, label, made, missed, positions);
+        els.stats.appendChild(card);
+      });
+    }
+
+    function renderHeatmap(positionsByRobot) {
+      const canvas = els.heatmapLayer;
+      const width = Math.max(1, els.fieldFrame.clientWidth || 1);
+      const height = Math.max(1, els.fieldFrame.clientHeight || 1);
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.round(width * dpr));
+      canvas.height = Math.max(1, Math.round(height * dpr));
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+
+      if (!state.filters.layers.positions || !state.filters.positions.showHeatmap) return;
+
+      ctx.globalCompositeOperation = "lighter";
+      const radius = state.filters.positions.heatRadius;
+      positionsByRobot.forEach((samples, robot) => {
+        if (!samples.length) return;
+        const color = robotColor(robot);
+        const step = Math.max(1, Math.ceil(samples.length / 1600));
+        for (let i = 0; i < samples.length; i += step) {
+          const sample = samples[i];
+          const x = fieldToImageX(sample.x, width);
+          const y = fieldToImageY(sample.y, height);
+          const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
+          gradient.addColorStop(0, rgba(color, 0.23));
+          gradient.addColorStop(0.45, rgba(color, 0.12));
+          gradient.addColorStop(1, rgba(color, 0));
+          ctx.fillStyle = gradient;
+          ctx.beginPath();
+          ctx.arc(x, y, radius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      });
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    function renderOverlay(shots, positionsByRobot) {
+      const width = Math.max(1, els.fieldFrame.clientWidth || 1);
+      const height = Math.max(1, els.fieldFrame.clientHeight || 1);
+      els.overlay.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      els.overlay.innerHTML = "";
+
+      if (state.filters.layers.positions) {
+        if (state.filters.positions.showTrajectory) {
+          renderTrajectories(positionsByRobot, width, height);
+        }
+        if (state.filters.positions.showSamples) {
+          renderPositionSamples(positionsByRobot, width, height);
+        }
+        if (state.filters.positions.showEndpoints) {
+          renderEndpoints(positionsByRobot, width, height);
+        }
+        if (state.filters.positions.showCentroids) {
+          renderCentroids(positionsByRobot, width, height);
+        }
+      }
+
+      if (state.filters.layers.shots) {
+        renderShots(shots, width, height);
+      }
+    }
+
+    function renderTrajectories(positionsByRobot, width, height) {
+      positionsByRobot.forEach((samples, robot) => {
+        if (samples.length < 2) return;
+        const polyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+        const step = Math.max(1, Math.ceil(samples.length / 1400));
+        const points = [];
+        for (let i = 0; i < samples.length; i += step) {
+          const sample = samples[i];
+          points.push(`${fieldToImageX(sample.x, width)},${fieldToImageY(sample.y, height)}`);
+        }
+        const last = samples[samples.length - 1];
+        points.push(`${fieldToImageX(last.x, width)},${fieldToImageY(last.y, height)}`);
+        polyline.setAttribute("points", points.join(" "));
+        polyline.setAttribute("fill", "none");
+        polyline.setAttribute("stroke", rgba(robotColor(robot), 0.8));
+        polyline.setAttribute("stroke-width", "2.4");
+        polyline.setAttribute("stroke-linejoin", "round");
+        polyline.setAttribute("stroke-linecap", "round");
+        els.overlay.appendChild(polyline);
+      });
+    }
+
+    function renderPositionSamples(positionsByRobot, width, height) {
+      positionsByRobot.forEach((samples, robot) => {
+        if (!samples.length) return;
+        const color = robotColor(robot);
+        const step = Math.max(1, Math.ceil(samples.length / 420));
+        for (let i = 0; i < samples.length; i += step) {
+          const sample = samples[i];
+          const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+          const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+          const x = fieldToImageX(sample.x, width);
+          const y = fieldToImageY(sample.y, height);
+          dot.setAttribute("cx", x);
+          dot.setAttribute("cy", y);
+          dot.setAttribute("r", "2.8");
+          dot.setAttribute("fill", rgba(color, 0.55));
+          dot.setAttribute("stroke", rgba("#ffffff", 0.5));
+          dot.setAttribute("stroke-width", "0.9");
+          group.appendChild(dot);
+          bindTooltip(group, () => tooltipForSample(sample));
+          els.overlay.appendChild(group);
+        }
+      });
+    }
+
+    function renderEndpoints(positionsByRobot, width, height) {
+      positionsByRobot.forEach((samples, robot) => {
+        if (!samples.length) return;
+        const start = samples[0];
+        const end = samples[samples.length - 1];
+        const color = robotColor(robot);
+
+        const startGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        const startRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        const sx = fieldToImageX(start.x, width);
+        const sy = fieldToImageY(start.y, height);
+        startRect.setAttribute("x", sx - 4.5);
+        startRect.setAttribute("y", sy - 4.5);
+        startRect.setAttribute("width", "9");
+        startRect.setAttribute("height", "9");
+        startRect.setAttribute("fill", rgba(color, 0.2));
+        startRect.setAttribute("stroke", color);
+        startRect.setAttribute("stroke-width", "2");
+        startGroup.appendChild(startRect);
+        bindTooltip(startGroup, () => tooltipForEndpoint("Start", start));
+        els.overlay.appendChild(startGroup);
+
+        const endGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        const endDiamond = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+        const ex = fieldToImageX(end.x, width);
+        const ey = fieldToImageY(end.y, height);
+        endDiamond.setAttribute("points", `${ex},${ey - 6} ${ex + 6},${ey} ${ex},${ey + 6} ${ex - 6},${ey}`);
+        endDiamond.setAttribute("fill", rgba(color, 0.2));
+        endDiamond.setAttribute("stroke", color);
+        endDiamond.setAttribute("stroke-width", "2");
+        endGroup.appendChild(endDiamond);
+        bindTooltip(endGroup, () => tooltipForEndpoint("End", end));
+        els.overlay.appendChild(endGroup);
+      });
+    }
+
+    function renderCentroids(positionsByRobot, width, height) {
+      positionsByRobot.forEach((samples, robot) => {
+        if (!samples.length) return;
+        const centroid = computeCentroid(samples);
+        const color = robotColor(robot);
+        const x = fieldToImageX(centroid.x, width);
+        const y = fieldToImageY(centroid.y, height);
+
+        const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        const ring = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        const hLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        const vLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        ring.setAttribute("cx", x);
+        ring.setAttribute("cy", y);
+        ring.setAttribute("r", "7");
+        ring.setAttribute("fill", rgba(color, 0.12));
+        ring.setAttribute("stroke", color);
+        ring.setAttribute("stroke-width", "2");
+
+        hLine.setAttribute("x1", x - 10);
+        hLine.setAttribute("y1", y);
+        hLine.setAttribute("x2", x + 10);
+        hLine.setAttribute("y2", y);
+        hLine.setAttribute("stroke", rgba(color, 0.9));
+        hLine.setAttribute("stroke-width", "1.8");
+
+        vLine.setAttribute("x1", x);
+        vLine.setAttribute("y1", y - 10);
+        vLine.setAttribute("x2", x);
+        vLine.setAttribute("y2", y + 10);
+        vLine.setAttribute("stroke", rgba(color, 0.9));
+        vLine.setAttribute("stroke-width", "1.8");
+
+        group.append(ring, hLine, vLine);
+        bindTooltip(group, () => tooltipForCentroid(robot, centroid, samples.length));
+        els.overlay.appendChild(group);
+      });
+    }
+
+    function renderShots(shots, width, height) {
+      shots.forEach((shot) => {
+        const x = fieldToImageX(shot.x, width);
+        const y = fieldToImageY(shot.y, height);
+        const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        const fill = shot.result === "made" ? cssVar("--green") : cssVar("--red");
+        const stroke = robotColor(shot.robot);
+        const radius = state.filters.shots.dotSize;
+        const highlightShootOnMove = state.filters.shots.showShootOnMove && isShootOnMove(shot);
+
+        if (shot.result === "made") {
+          const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+          const ring = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+
+          ring.setAttribute("cx", x);
+          ring.setAttribute("cy", y);
+          ring.setAttribute("r", radius + 3);
+          ring.setAttribute("fill", "rgba(8, 15, 20, 0.28)");
+          ring.setAttribute("stroke", stroke);
+          ring.setAttribute("stroke-width", "2.5");
+
+          circle.setAttribute("cx", x);
+          circle.setAttribute("cy", y);
+          circle.setAttribute("r", radius);
+          circle.setAttribute("fill", fill);
+          circle.setAttribute("stroke", "rgba(255,255,255,0.92)");
+          circle.setAttribute("stroke-width", "1.6");
+
+          group.append(ring, circle);
+          if (highlightShootOnMove) {
+            const highlight = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            highlight.setAttribute("cx", x);
+            highlight.setAttribute("cy", y);
+            highlight.setAttribute("r", radius + 7);
+            highlight.setAttribute("fill", "none");
+            highlight.setAttribute("stroke", cssVar("--gold"));
+            highlight.setAttribute("stroke-width", "3");
+            highlight.setAttribute("stroke-dasharray", "3 4");
+            group.appendChild(highlight);
+          }
+        } else {
+          const ring = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+          const hLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          const vLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          const arm = radius + 3;
+
+          ring.setAttribute("cx", x);
+          ring.setAttribute("cy", y);
+          ring.setAttribute("r", radius + 1);
+          ring.setAttribute("fill", "rgba(8, 15, 20, 0.22)");
+          ring.setAttribute("stroke", stroke);
+          ring.setAttribute("stroke-width", "2");
+
+          hLine.setAttribute("x1", x - arm);
+          hLine.setAttribute("y1", y);
+          hLine.setAttribute("x2", x + arm);
+          hLine.setAttribute("y2", y);
+          hLine.setAttribute("stroke", fill);
+          hLine.setAttribute("stroke-width", "2.4");
+          hLine.setAttribute("stroke-linecap", "round");
+
+          vLine.setAttribute("x1", x);
+          vLine.setAttribute("y1", y - arm);
+          vLine.setAttribute("x2", x);
+          vLine.setAttribute("y2", y + arm);
+          vLine.setAttribute("stroke", fill);
+          vLine.setAttribute("stroke-width", "2.4");
+          vLine.setAttribute("stroke-linecap", "round");
+
+          group.append(ring, hLine, vLine);
+        }
+
+        if (state.filters.shots.showLabels) {
+          const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+          label.setAttribute("x", x + radius + 6);
+          label.setAttribute("y", y - radius - 3);
+          label.setAttribute("fill", highlightShootOnMove ? cssVar("--gold") : stroke);
+          label.setAttribute("font-size", "13");
+          label.setAttribute("font-weight", "700");
+          label.setAttribute("paint-order", "stroke");
+          label.setAttribute("stroke", "rgba(0,0,0,0.72)");
+          label.setAttribute("stroke-width", "3");
+          label.textContent = highlightShootOnMove ? `R${shot.robot} SOTM` : `R${shot.robot}`;
+          group.appendChild(label);
+        }
+
+        bindTooltip(group, () => tooltipForShot(shot));
+        els.overlay.appendChild(group);
+      });
+    }
+
+    function computeCentroid(samples) {
+      let sumX = 0;
+      let sumY = 0;
+      samples.forEach((sample) => {
+        sumX += sample.x;
+        sumY += sample.y;
+      });
+      return {
+        x: sumX / samples.length,
+        y: sumY / samples.length,
+      };
+    }
+
+    function bindTooltip(node, htmlBuilder) {
+      node.addEventListener("mousemove", (event) => showTooltip(event, htmlBuilder()));
+      node.addEventListener("mouseleave", hideTooltip);
+    }
+
+    function tooltipForShot(shot) {
+      const speedText = Number.isFinite(shot.speedInPerS) ? `${shot.speedInPerS.toFixed(1)} in/s` : "n/a";
+      return `
+        <strong>Robot ${shot.robot} ${shot.result === "made" ? "made" : "missed"} shot</strong>
+        x: ${shot.x.toFixed(2)} in<br>
+        y: ${shot.y.toFixed(2)} in<br>
+        goal: ${shot.goal || "unknown"}<br>
+        speed: ${speedText}<br>
+        shoot on the move: ${isShootOnMove(shot) ? "yes" : "no"}<br>
+        t: ${Number.isFinite(shot.timestamp) ? shot.timestamp.toFixed(2) : "n/a"} s
+      `;
+    }
+
+    function tooltipForSample(sample) {
+      return `
+        <strong>Robot ${sample.robot} position sample</strong>
+        x: ${sample.x.toFixed(2)} in<br>
+        y: ${sample.y.toFixed(2)} in<br>
+        t: ${Number.isFinite(sample.timestamp) ? sample.timestamp.toFixed(2) : "n/a"} s
+      `;
+    }
+
+    function tooltipForEndpoint(label, sample) {
+      return `
+        <strong>${label} position for Robot ${sample.robot}</strong>
+        x: ${sample.x.toFixed(2)} in<br>
+        y: ${sample.y.toFixed(2)} in<br>
+        t: ${Number.isFinite(sample.timestamp) ? sample.timestamp.toFixed(2) : "n/a"} s
+      `;
+    }
+
+    function tooltipForCentroid(robot, centroid, count) {
+      return `
+        <strong>Robot ${robot} activity centroid</strong>
+        x: ${centroid.x.toFixed(2)} in<br>
+        y: ${centroid.y.toFixed(2)} in<br>
+        samples: ${count}
+      `;
+    }
+
+    function showTooltip(event, html) {
+      els.tooltip.style.display = "block";
+      els.tooltip.innerHTML = html;
+      els.tooltip.style.left = `${event.clientX + 14}px`;
+      els.tooltip.style.top = `${event.clientY + 14}px`;
+    }
+
+    function hideTooltip() {
+      els.tooltip.style.display = "none";
+    }
+
+    async function handleCsvFile() {
+      const file = els.csvFile.files[0];
+      if (!file) return;
+      const text = await file.text();
+      const rows = parseCsv(text);
+      state.positionsByRobot = extractPositions(rows);
+      state.shots = annotateShotsWithMotion(extractShots(rows), state.positionsByRobot);
+      render();
+    }
+
+    els.csvFile.addEventListener("change", () => {
+      handleCsvFile().catch((error) => {
+        console.error(error);
+        setStatus(`Failed to parse CSV: ${error.message}`);
+      });
+    });
+
+    els.reloadImage.addEventListener("click", reloadImage);
+    els.imageUrl.addEventListener("change", reloadImage);
+
+    els.showShotLayer.addEventListener("change", () => {
+      state.filters.layers.shots = els.showShotLayer.checked;
+      render();
+    });
+    els.showPositionLayer.addEventListener("change", () => {
+      state.filters.layers.positions = els.showPositionLayer.checked;
+      render();
+    });
+
+    els.showMade.addEventListener("change", () => {
+      state.filters.shots.showMade = els.showMade.checked;
+      render();
+    });
+    els.showMissed.addEventListener("change", () => {
+      state.filters.shots.showMissed = els.showMissed.checked;
+      render();
+    });
+    els.showLabels.addEventListener("change", () => {
+      state.filters.shots.showLabels = els.showLabels.checked;
+      render();
+    });
+    els.showShootOnMove.addEventListener("change", () => {
+      state.filters.shots.showShootOnMove = els.showShootOnMove.checked;
+      render();
+    });
+
+    els.showTrajectory.addEventListener("change", () => {
+      state.filters.positions.showTrajectory = els.showTrajectory.checked;
+      render();
+    });
+    els.showHeatmap.addEventListener("change", () => {
+      state.filters.positions.showHeatmap = els.showHeatmap.checked;
+      render();
+    });
+    els.showCentroids.addEventListener("change", () => {
+      state.filters.positions.showCentroids = els.showCentroids.checked;
+      render();
+    });
+    els.showEndpoints.addEventListener("change", () => {
+      state.filters.positions.showEndpoints = els.showEndpoints.checked;
+      render();
+    });
+    els.showSamples.addEventListener("change", () => {
+      state.filters.positions.showSamples = els.showSamples.checked;
+      render();
+    });
+
+    els.rotateField.addEventListener("click", () => {
+      state.rotationQuarterTurns = (state.rotationQuarterTurns + 1) % 4;
+      syncFrameSize();
+      updateRotationButton();
+      render();
+    });
+
+    els.dotSize.addEventListener("input", () => {
+      state.filters.shots.dotSize = Number(els.dotSize.value);
+      els.dotSizeValue.textContent = els.dotSize.value;
+      render();
+    });
+    els.shotMoveSpeed.addEventListener("input", () => {
+      state.filters.shots.shotMoveSpeed = Number(els.shotMoveSpeed.value);
+      els.shotMoveSpeedValue.textContent = els.shotMoveSpeed.value;
+      render();
+    });
+    els.heatRadius.addEventListener("input", () => {
+      state.filters.positions.heatRadius = Number(els.heatRadius.value);
+      els.heatRadiusValue.textContent = els.heatRadius.value;
+      render();
+    });
+
+    new ResizeObserver(() => render()).observe(els.fieldShell);
+    els.fieldImage.addEventListener("load", () => {
+      syncFrameSize();
+      if (!state.shots.length && !totalPositionSamples(state.positionsByRobot)) {
+        setStatus("Load a CSV to begin.");
+      }
+      render();
+    });
+    els.fieldImage.addEventListener("error", () => {
+      setStatus("Field image failed to load. Enter a reachable local path or URL and reload.");
+    });
+
+    initRobotFilters();
+    updateRotationButton();
+    reloadImage();
+    render();
+  </script>
+</body>
+</html>

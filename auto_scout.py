@@ -99,6 +99,14 @@ def _field_center_to_corner_xy(x_in: float, y_in: float) -> Tuple[float, float]:
     return float(x_in) + FIELD_CENTER_OFFSET_IN, float(y_in) + FIELD_CENTER_OFFSET_IN
 
 
+def _normalize_angle_rad(angle: float) -> float:
+    while angle <= -math.pi:
+        angle += math.tau
+    while angle > math.pi:
+        angle -= math.tau
+    return angle
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # WPILOG writer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,6 +181,15 @@ class RobotPose:
     @property
     def y_m(self): return self.y_center_in * 0.0254
 
+    @property
+    def wpilog_x_m(self): return self.y_center_in * 0.0254
+
+    @property
+    def wpilog_y_m(self): return -self.x_center_in * 0.0254
+
+    @property
+    def wpilog_heading_rad(self): return _normalize_angle_rad(self.heading - (math.pi / 2.0))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MergeGroup  (v3.2: adds entry_order / current_order for permutation tracking)
@@ -214,6 +231,388 @@ class MergeGroup:
     peak_assignment: dict                  = dc_field(default_factory=dict)
     order_votes    : dict                  = dc_field(default_factory=dict)
     entry_features : dict                  = dc_field(default_factory=dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shot detection
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class ShotEvent:
+    shooter_id: int
+    result: str
+    shot_x_in: float
+    shot_y_in: float
+    frame_num: int
+    timestamp_s: float
+    goal_color: str = ""
+
+
+@dataclass
+class BallTrack:
+    track_id: int
+    samples: List[Tuple[int, float, float]] = dc_field(default_factory=list)
+    missing_frames: int = 0
+    launched: bool = False
+    shooter_id: Optional[int] = None
+    shooter_dist_px: Optional[float] = None
+    shooter_pos_center_in: Optional[Tuple[float, float]] = None
+    goal_color: str = ""
+    entered_goal: bool = False
+    approached_goal: bool = False
+    resolved: bool = False
+
+    @property
+    def last_point(self) -> Optional[Tuple[int, float, float]]:
+        return self.samples[-1] if self.samples else None
+
+    @property
+    def first_point(self) -> Optional[Tuple[int, float, float]]:
+        return self.samples[0] if self.samples else None
+
+
+class ShotDetector:
+    BALL_MIN_CONTOUR_AREA_PX = 14.0
+    BALL_MAX_CONTOUR_AREA_PX = 420.0
+    BALL_ASSOC_DIST_PX = 34.0
+    BALL_ASSOC_DIST_FAST_PX = 82.0
+    BALL_MAX_MISSING = 5
+    SHOT_MAX_START_DIST_PX = 46.0
+    SHOT_MIN_DISP_PX = 18.0
+    SHOT_MIN_SPEED_PX = 5.0
+    SHOT_MIN_UPWARD_PX = 8.0
+    SHOT_MIN_LIFE_FRAMES = 3
+    GOAL_OPENING_TOP_FRAC = 0.58
+    GOAL_APPROACH_SIDE_PAD_FRAC = 0.30
+    GOAL_APPROACH_DOWN_FRAC = 0.95
+    GOAL_BLUE_HSV_LO = (95, 80, 45)
+    GOAL_BLUE_HSV_HI = (135, 255, 255)
+    GOAL_RED1_HSV_LO = (0, 90, 45)
+    GOAL_RED1_HSV_HI = (12, 255, 255)
+    GOAL_RED2_HSV_LO = (170, 90, 45)
+    GOAL_RED2_HSV_HI = (179, 255, 255)
+    GOAL_MIN_AREA_PX = 900.0
+
+    def __init__(self, cv2, np):
+        self.cv2, self.np = cv2, np
+        self._next_track_id = 1
+        self._tracks: Dict[int, BallTrack] = {}
+        self._goal_openings: Dict[str, object] = {}
+        self._goal_approaches: Dict[str, object] = {}
+        self._ready = False
+
+    def setup(self, tracker) -> None:
+        if tracker._bg is None or tracker._field_mask is None:
+            return
+        openings = self._detect_goal_openings(tracker._bg, tracker._field_mask)
+        if not openings:
+            openings = self._fallback_goal_openings(tracker)
+        if not openings:
+            print("[WARN] Shot detector could not determine goal openings.")
+            return
+        self._goal_openings = openings
+        self._goal_approaches = {
+            color: self._build_goal_approach(poly)
+            for color, poly in openings.items()
+        }
+        self._ready = True
+        print("[INFO] Shot detector goal openings ready: {}".format(
+            ", ".join(sorted(openings.keys()))))
+
+    def update(self, frame_num: int, match_time_s: float, poses, tracker) -> List[ShotEvent]:
+        if not self._ready or tracker._last_ball_mask is None or tracker._H_inv is None:
+            return []
+
+        detections = self._extract_ball_detections(tracker._last_ball_mask)
+        robot_refs = self._robot_refs(poses, tracker)
+        self._associate_tracks(detections, robot_refs, frame_num)
+
+        events = []
+        for track in list(self._tracks.values()):
+            if not track.samples or track.resolved:
+                continue
+            self._update_goal_state(track)
+            self._maybe_mark_launched(track)
+            if track.missing_frames > self.BALL_MAX_MISSING:
+                event = self._resolve_track(track, frame_num, match_time_s)
+                if event is not None:
+                    events.append(event)
+                del self._tracks[track.track_id]
+        return events
+
+    def draw_debug(self, dbg) -> None:
+        if not self._ready:
+            return
+        cv2 = self.cv2
+        for color, poly in self._goal_approaches.items():
+            cv_color = (255, 180, 60) if color == "blue" else (80, 180, 255)
+            cv2.polylines(dbg, [poly], True, cv_color, 1, cv2.LINE_AA)
+        for color, poly in self._goal_openings.items():
+            cv_color = (255, 80, 0) if color == "blue" else (0, 80, 255)
+            cv2.polylines(dbg, [poly], True, cv_color, 2, cv2.LINE_AA)
+        for track in self._tracks.values():
+            pts = [(int(round(x)), int(round(y))) for _f, x, y in track.samples[-8:]]
+            if len(pts) >= 2:
+                cv2.polylines(
+                    dbg,
+                    [self.np.array(pts, dtype=self.np.int32).reshape(-1, 1, 2)],
+                    False,
+                    (0, 255, 255) if track.launched else (180, 180, 180),
+                    2,
+                    cv2.LINE_AA,
+                )
+            if pts:
+                px, py = pts[-1]
+                label = "S{}".format(track.shooter_id) if track.launched and track.shooter_id is not None else "b"
+                if track.entered_goal:
+                    label += ":goal"
+                cv2.putText(dbg, label, (px + 4, py - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    def _extract_ball_detections(self, ball_mask):
+        cv2 = self.cv2
+        cnts, _ = cv2.findContours(ball_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        detections = []
+        for c in cnts:
+            area = float(cv2.contourArea(c))
+            if area < self.BALL_MIN_CONTOUR_AREA_PX or area > self.BALL_MAX_CONTOUR_AREA_PX:
+                continue
+            M = cv2.moments(c)
+            if M["m00"] <= 0:
+                continue
+            cx = float(M["m10"] / M["m00"])
+            cy = float(M["m01"] / M["m00"])
+            detections.append((cx, cy, area))
+        return detections
+
+    def _robot_refs(self, poses, tracker):
+        refs = []
+        for rid, pose in enumerate(poses):
+            if not pose.visible:
+                continue
+            pt = self.np.array([[[pose.x_in, pose.y_in]]], dtype=self.np.float32)
+            ip = self.cv2.perspectiveTransform(pt, tracker._H_inv)[0][0]
+            refs.append({
+                "id": rid,
+                "img": (float(ip[0]), float(ip[1])),
+                "center": (float(pose.x_center_in), float(pose.y_center_in)),
+            })
+        return refs
+
+    def _associate_tracks(self, detections, robot_refs, frame_num: int) -> None:
+        unmatched_tracks = set(self._tracks.keys())
+        unmatched_dets = set(range(len(detections)))
+        pairs = []
+        for tid, track in self._tracks.items():
+            pred_x, pred_y = self._predict_track_point(track)
+            max_dist = self.BALL_ASSOC_DIST_FAST_PX if track.launched else self.BALL_ASSOC_DIST_PX
+            for di, (cx, cy, _area) in enumerate(detections):
+                d = math.hypot(cx - pred_x, cy - pred_y)
+                if d <= max_dist:
+                    pairs.append((d, tid, di))
+        pairs.sort()
+        for _d, tid, di in pairs:
+            if tid not in unmatched_tracks or di not in unmatched_dets:
+                continue
+            cx, cy, _area = detections[di]
+            track = self._tracks[tid]
+            track.samples.append((frame_num, cx, cy))
+            track.missing_frames = 0
+            unmatched_tracks.remove(tid)
+            unmatched_dets.remove(di)
+
+        for tid in unmatched_tracks:
+            self._tracks[tid].missing_frames += 1
+
+        for di in unmatched_dets:
+            cx, cy, _area = detections[di]
+            nearest_id = None
+            nearest_dist = None
+            nearest_center = None
+            for ref in robot_refs:
+                dist = math.hypot(cx - ref["img"][0], cy - ref["img"][1])
+                if nearest_dist is None or dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest_id = ref["id"]
+                    nearest_center = ref["center"]
+            self._tracks[self._next_track_id] = BallTrack(
+                track_id=self._next_track_id,
+                samples=[(frame_num, cx, cy)],
+                shooter_id=nearest_id,
+                shooter_dist_px=nearest_dist,
+                shooter_pos_center_in=nearest_center,
+            )
+            self._next_track_id += 1
+
+    def _predict_track_point(self, track: BallTrack) -> Tuple[float, float]:
+        if len(track.samples) < 2:
+            _f, x, y = track.samples[-1]
+            return x, y
+        _f1, x1, y1 = track.samples[-1]
+        _f0, x0, y0 = track.samples[-2]
+        return x1 + (x1 - x0), y1 + (y1 - y0)
+
+    def _update_goal_state(self, track: BallTrack) -> None:
+        _f, x, y = track.samples[-1]
+        for color, poly in self._goal_approaches.items():
+            if self.cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0:
+                track.approached_goal = True
+                if not track.goal_color:
+                    track.goal_color = color
+        for color, poly in self._goal_openings.items():
+            if self.cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0:
+                track.entered_goal = True
+                track.goal_color = color
+                break
+
+    def _maybe_mark_launched(self, track: BallTrack) -> None:
+        if track.launched or len(track.samples) < self.SHOT_MIN_LIFE_FRAMES:
+            return
+        if track.shooter_id is None or track.shooter_dist_px is None:
+            return
+        if track.shooter_dist_px > self.SHOT_MAX_START_DIST_PX:
+            return
+        first = track.first_point
+        last = track.last_point
+        if first is None or last is None:
+            return
+        f0, x0, y0 = first
+        f1, x1, y1 = last
+        dt = max(f1 - f0, 1)
+        disp = math.hypot(x1 - x0, y1 - y0)
+        avg_speed = disp / dt
+        if disp < self.SHOT_MIN_DISP_PX or avg_speed < self.SHOT_MIN_SPEED_PX:
+            return
+        if (y1 - y0) > -self.SHOT_MIN_UPWARD_PX:
+            return
+        track.launched = True
+
+    def _resolve_track(self, track: BallTrack, frame_num: int, match_time_s: float) -> Optional[ShotEvent]:
+        if not track.launched or track.shooter_id is None or track.shooter_pos_center_in is None:
+            return None
+        if track.entered_goal:
+            result = "made"
+        elif track.approached_goal or self._track_reached_top(track):
+            result = "missed"
+        else:
+            return None
+        sx, sy = track.shooter_pos_center_in
+        track.resolved = True
+        return ShotEvent(
+            shooter_id=track.shooter_id,
+            result=result,
+            shot_x_in=float(sx),
+            shot_y_in=float(sy),
+            frame_num=frame_num,
+            timestamp_s=match_time_s,
+            goal_color=track.goal_color,
+        )
+
+    def _track_reached_top(self, track: BallTrack) -> bool:
+        if not track.samples:
+            return False
+        top_y = min(y for _f, _x, y in track.samples)
+        goal_top = min(
+            min(poly[:, 0, 1]) for poly in self._goal_approaches.values()
+        ) if self._goal_approaches else 0.0
+        goal_bottom = max(
+            max(poly[:, 0, 1]) for poly in self._goal_approaches.values()
+        ) if self._goal_approaches else 0.0
+        return top_y <= goal_bottom + max(14.0, 0.2 * max(goal_bottom - goal_top, 1.0))
+
+    def _detect_goal_openings(self, background, field_mask):
+        cv2, np = self.cv2, self.np
+        hsv = cv2.cvtColor(background, cv2.COLOR_BGR2HSV)
+        h, w = background.shape[:2]
+        top_band = np.zeros((h, w), dtype=np.uint8)
+        top_band[:max(1, int(round(h * 0.55))), :] = 255
+
+        masks = {
+            "blue": cv2.inRange(
+                hsv,
+                np.array(self.GOAL_BLUE_HSV_LO, dtype=np.uint8),
+                np.array(self.GOAL_BLUE_HSV_HI, dtype=np.uint8),
+            ),
+            "red": cv2.bitwise_or(
+                cv2.inRange(
+                    hsv,
+                    np.array(self.GOAL_RED1_HSV_LO, dtype=np.uint8),
+                    np.array(self.GOAL_RED1_HSV_HI, dtype=np.uint8),
+                ),
+                cv2.inRange(
+                    hsv,
+                    np.array(self.GOAL_RED2_HSV_LO, dtype=np.uint8),
+                    np.array(self.GOAL_RED2_HSV_HI, dtype=np.uint8),
+                ),
+            ),
+        }
+
+        openings = {}
+        for color, mask in masks.items():
+            mask = cv2.bitwise_and(mask, top_band)
+            if color == "blue":
+                mask[:, w // 2:] = 0
+            else:
+                mask[:, :w // 2] = 0
+            kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kern)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern)
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+            chosen = None
+            for c in cnts:
+                area = float(cv2.contourArea(c))
+                if area < self.GOAL_MIN_AREA_PX:
+                    continue
+                x, y, ww, hh = cv2.boundingRect(c)
+                if y > int(0.22 * h):
+                    continue
+                chosen = c
+                break
+            if chosen is None:
+                continue
+            x, y, ww, hh = cv2.boundingRect(chosen)
+            pts = chosen.reshape(-1, 2)
+            top_pts = pts[pts[:, 1] <= y + hh * self.GOAL_OPENING_TOP_FRAC]
+            if len(top_pts) >= 3:
+                hull = cv2.convexHull(top_pts.reshape(-1, 1, 2).astype(np.int32))
+            else:
+                hull = cv2.convexHull(chosen)
+            openings[color] = hull
+        return openings
+
+    def _fallback_goal_openings(self, tracker):
+        if tracker._H_inv is None:
+            return {}
+        cv2, np = self.cv2, self.np
+        field_points = {
+            "blue": [(-8.0, -72.0), (-8.0, -40.0), (-36.0, -56.0)],
+            "red": [(8.0, -72.0), (36.0, -56.0), (8.0, -40.0)],
+        }
+        openings = {}
+        for color, pts_center in field_points.items():
+            pts_corner = [_field_center_to_corner_xy(x, y) for x, y in pts_center]
+            arr = np.array([pts_corner], dtype=np.float32)
+            img = cv2.perspectiveTransform(arr, tracker._H_inv)[0]
+            openings[color] = np.round(img).astype(np.int32).reshape(-1, 1, 2)
+        return openings
+
+    def _build_goal_approach(self, poly):
+        pts = poly.reshape(-1, 2).astype(self.np.float32)
+        x_min = float(self.np.min(pts[:, 0]))
+        x_max = float(self.np.max(pts[:, 0]))
+        y_min = float(self.np.min(pts[:, 1]))
+        y_max = float(self.np.max(pts[:, 1]))
+        w = max(x_max - x_min, 1.0)
+        h = max(y_max - y_min, 1.0)
+        pad_x = w * self.GOAL_APPROACH_SIDE_PAD_FRAC
+        down = h * self.GOAL_APPROACH_DOWN_FRAC
+        rect = self.np.array([
+            [x_min - pad_x, y_min],
+            [x_max + pad_x, y_min],
+            [x_max + pad_x, y_max + down],
+            [x_min - pad_x, y_max + down],
+        ], dtype=self.np.int32)
+        return rect.reshape(-1, 1, 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2089,9 +2488,14 @@ def process_match(
         "robot1_x_in","robot1_y_in","robot1_heading_rad","robot1_visible",
         "robot2_x_in","robot2_y_in","robot2_heading_rad","robot2_visible",
         "robot3_x_in","robot3_y_in","robot3_heading_rad","robot3_visible",
+        "robot0_shot_result","robot0_shot_x_in","robot0_shot_y_in","robot0_shot_goal",
+        "robot1_shot_result","robot1_shot_x_in","robot1_shot_y_in","robot1_shot_goal",
+        "robot2_shot_result","robot2_shot_x_in","robot2_shot_y_in","robot2_shot_goal",
+        "robot3_shot_result","robot3_shot_x_in","robot3_shot_y_in","robot3_shot_goal",
     ])
 
     tracker        = RobotTracker(cv2, np)
+    shot_detector  = ShotDetector(cv2, np)
     field_detector = FieldDetector(cv2, np)
 
     ordered = None; H_2d = None; H_inv = None
@@ -2109,6 +2513,7 @@ def process_match(
             ordered, np.array([[0,0],[144,0],[144,144],[0,144]], np.float32))
         H_inv = np.linalg.inv(H_2d)
         tracker.setup(video_path, ordered, frame_shape)
+        shot_detector.setup(tracker)
         print("[INFO] Manual corners loaded.")
         if tracker._bg is not None:
             bg_path = os.path.join(output_dir, "median_background.jpg")
@@ -2181,12 +2586,14 @@ def process_match(
                 ordered, H_2d = result
                 H_inv = np.linalg.inv(H_2d)
                 tracker.setup(video_path, ordered, frame.shape)
+                shot_detector.setup(tracker)
                 print("\n  [t={:.1f}s] Field auto-detected.".format(match_time_s))
                 if tracker._bg is not None:
                     cv2.imwrite(os.path.join(output_dir, "median_background.jpg"),
                                 tracker._bg)
 
         poses = tracker.update(frame)
+        shot_events = shot_detector.update(current_frame_num, match_time_s, poses, tracker)
         merge_active = bool(tracker._merge_groups)
         recent_merge = any(v > 0 for v in tracker._merge_recent)
         if merge_active or recent_merge:
@@ -2199,13 +2606,30 @@ def process_match(
             merge_debug_hold -= 1
 
         for i, p in enumerate(poses):
-            log.write_pose2d(pose_eids[i], timestamp_us, p.x_m, p.y_m, p.heading)
+            log.write_pose2d(
+                pose_eids[i],
+                timestamp_us,
+                p.wpilog_x_m,
+                p.wpilog_y_m,
+                p.wpilog_heading_rad,
+            )
             log.write_boolean(vis_eids[i], timestamp_us, p.visible)
 
         row = ["{:.4f}".format(match_time_s)]
         for p in poses:
             row += ["{:.2f}".format(p.x_center_in), "{:.2f}".format(p.y_center_in),
                     "{:.4f}".format(p.heading), "1" if p.visible else "0"]
+        shot_cells = [["", "", "", ""] for _ in range(4)]
+        for event in shot_events:
+            if 0 <= event.shooter_id < 4:
+                shot_cells[event.shooter_id] = [
+                    event.result,
+                    "{:.2f}".format(event.shot_x_in),
+                    "{:.2f}".format(event.shot_y_in),
+                    event.goal_color,
+                ]
+        for cells in shot_cells:
+            row += cells
         csv_writer.writerow(row)
 
         if debug and debug_dir and H_inv is not None:
@@ -2214,6 +2638,7 @@ def process_match(
             if ordered is not None:
                 cv2.polylines(dbg, [ordered.astype(np.int32).reshape(-1,1,2)],
                               True, (0, 200, 0), 2)
+                shot_detector.draw_debug(dbg)
 
             if tracker._bg is not None:
                 fg_debug = tracker._foreground_mask(frame)
@@ -2321,6 +2746,15 @@ def process_match(
                 if current_frame_num >= next_debug_source_frame:
                     while current_frame_num >= next_debug_source_frame:
                         next_debug_source_frame += base_debug_interval
+
+        for event in shot_events:
+            print("[INFO] Shot {} by R{} at ({:.1f},{:.1f}) goal={}".format(
+                event.result,
+                event.shooter_id,
+                event.shot_x_in,
+                event.shot_y_in,
+                event.goal_color or "unknown",
+            ))
 
         processed += 1
 

@@ -15,6 +15,15 @@ Current outputs are focused on robot motion:
 - `match_log.wpilog` for AdvantageScope playback
 - optional annotated debug frames in `output/tracker_debug/`
 
+The CSV now also includes per-robot shot-event columns:
+
+- `robot#_shot_result`
+- `robot#_shot_x_in`
+- `robot#_shot_y_in`
+- `robot#_shot_goal`
+
+These are populated on the frame where AutoScout resolves a shot as `made` or `missed`.
+
 Output coordinates now use a center-origin field frame:
 
 - `(0, 0)` is the center of the 144 inch x 144 inch field
@@ -74,9 +83,9 @@ That produces a `field_corners.json` file. Pass it to `auto_scout.py` with `--co
 When a run finishes, the output directory typically contains:
 
 - `robot_positions.csv`
-  Flat table of timestamped robot positions, headings, and visibility flags. `x/y` are in inches from field center.
+  Flat table of timestamped robot positions, headings, visibility flags, and shot events. `x/y` are in inches from field center.
 - `match_log.wpilog`
-  WPILOG output using the same center-origin coordinates, converted to meters.
+  WPILOG output using center-origin coordinates converted to meters and rotated by `-90°` relative to the CSV field frame.
 - `median_background.jpg`
   The median background image used for subtraction.
 - `tracker_debug/`

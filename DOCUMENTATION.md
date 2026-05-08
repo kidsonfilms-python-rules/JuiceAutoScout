@@ -73,6 +73,7 @@ Implementation detail:
 
 - the tracker still keeps its internal homography and state on the historical `0..144` field plane
 - external interfaces and outputs are converted by subtracting `72` inches from both axes
+- WPILOG adds one extra transform on export: it rotates the pose frame by `-90°` relative to the CSV/public field frame
 
 ### Robot IDs
 
@@ -186,6 +187,12 @@ Each run writes:
 - `median_background.jpg`: median background used for subtraction.
 - `tracker_debug/`: optional annotated frames when `--debug` is enabled.
 
+`robot_positions.csv` now also carries shot events:
+
+- per robot, the CSV records when AutoScout resolves a shot as `made` or `missed`
+- the recorded shot position is the shooter's field position in center-origin inches
+- the row is populated on the frame where the shot result becomes known
+
 ### CSV schema
 
 Header:
@@ -195,7 +202,11 @@ timestamp_s,
 robot0_x_in,robot0_y_in,robot0_heading_rad,robot0_visible,
 robot1_x_in,robot1_y_in,robot1_heading_rad,robot1_visible,
 robot2_x_in,robot2_y_in,robot2_heading_rad,robot2_visible,
-robot3_x_in,robot3_y_in,robot3_heading_rad,robot3_visible
+robot3_x_in,robot3_y_in,robot3_heading_rad,robot3_visible,
+robot0_shot_result,robot0_shot_x_in,robot0_shot_y_in,robot0_shot_goal,
+robot1_shot_result,robot1_shot_x_in,robot1_shot_y_in,robot1_shot_goal,
+robot2_shot_result,robot2_shot_x_in,robot2_shot_y_in,robot2_shot_goal,
+robot3_shot_result,robot3_shot_x_in,robot3_shot_y_in,robot3_shot_goal
 ```
 
 Notes:
@@ -204,6 +215,9 @@ Notes:
 - It is computed as `current_frame / video_fps - start_offset`.
 - `robotN_x_in` and `robotN_y_in` are center-origin coordinates in inches.
 - When a robot is missing, the row uses zeros and `visible=0` if the track is not being coasted.
+- `robotN_shot_result` is blank on most rows and becomes `made` or `missed` when a shot resolves.
+- `robotN_shot_x_in` / `robotN_shot_y_in` are the shooter's position in center-origin inches.
+- `robotN_shot_goal` is the goal opening the detector associated the shot with, currently `red` or `blue`.
 
 ### WPILOG contents
 
@@ -216,8 +230,9 @@ Pose entries are written as `x_m`, `y_m`, and `heading_rad`.
 
 Important note:
 
-- the WPILOG coordinates are also center-origin now
-- if you use a viewer that assumes a corner-origin field frame, the poses will appear offset unless that viewer is configured for a center-origin convention
+- the WPILOG coordinates are center-origin and also rotated by `-90°` relative to the CSV field frame
+- specifically, the exporter writes `x' = y`, `y' = -x`, and `heading' = heading - π/2`
+- if you compare CSV positions directly against AdvantageScope positions, expect this rotation difference
 
 ## Processing Pipeline
 
@@ -339,6 +354,8 @@ Ball masks are:
 - dilated slightly before subtraction
 
 The final foreground mask subtracts this ball mask.
+
+That same ball-color mask is also reused by the shot detector. Robot tracking removes balls from foreground segmentation, while shot detection separately tracks those colored ball blobs in image space.
 
 ### 8. Contour extraction and field-area filtering
 
@@ -601,6 +618,50 @@ How it works:
 
 This is a visualization tool, not part of the assignment logic.
 
+### 23. Shot detection
+
+The tracker now includes a separate heuristic shot detector built on top of the existing ball mask.
+
+At a high level:
+
+1. Detect the red and blue goal openings from the static background image.
+2. Detect purple/green ball blobs from the per-frame ball mask.
+3. Track those ball blobs in image space with nearest-neighbor association.
+4. Mark a blob as a launched shot only if it:
+   starts near a visible robot,
+   moves far enough,
+   moves fast enough,
+   and moves upward toward the goals.
+5. Resolve the launched shot as:
+   `made` if the tracked ball enters a goal-opening polygon and then disappears,
+   `missed` if it clearly approaches the goal region but never enters the opening before disappearing.
+
+Why image space instead of field space:
+
+- the ball is often airborne
+- the field homography assumes objects lie on the floor plane
+- goal openings are elevated structures, so image-space regions are more stable for scoring than trying to project the ball onto the carpet
+
+How goal openings are found:
+
+- on setup, AutoScout looks at the median background
+- it segments large red and blue static structures near the top corners
+- it extracts the upper part of those contours as the effective opening region
+- if that fails, it falls back to coarse polygons derived from the calibrated field corners
+
+What gets written to CSV:
+
+- no extra rows are added
+- instead, the current frame's row gets shot metadata for the shooter when a shot resolves
+- the shot position is the shooter's field position, not the ball position
+
+Important limitations:
+
+- this is heuristic shot detection, not full 3D projectile reconstruction
+- it depends on the ball color mask being clean for the event lighting
+- it can miss shots that are heavily occluded or merge into other colored objects
+- it can confuse unusual passes or fast ball-handling events with shots if the trajectory looks goal-directed
+
 ## `calibrate.py`
 
 `calibrate.py` is the preferred way to generate `field_corners.json`.
@@ -793,6 +854,8 @@ It uses those rows to jump back into the source video, project the labeled field
 
 Those `robotN_x_in` / `robotN_y_in` values are center-origin coordinates in inches.
 
+If shot-event columns are present, the manual re-ID loader simply ignores them.
+
 Because the current implementation treats `timestamp_s` as raw video time, not match-relative time, be careful when reusing CSVs produced with a nonzero `--start-offset` or a nonzero manual tracker export start.
 
 ## Tuning Constants and What They Mean
@@ -873,9 +936,9 @@ To visualize the WPILOG:
 5. Drag `Robot0/Pose` through `Robot3/Pose` into the pose list.
 6. Ensure the display expects meters and radians.
 
-The WPILOG writer already converts centered inches to meters before logging.
+The WPILOG writer converts centered inches to meters before logging and applies a `-90°` pose rotation relative to the CSV/public field frame.
 
-If your viewer assumes a corner-origin field, you may need to mentally account for the center-origin shift or configure the visualization accordingly.
+If your viewer assumes a different field orientation, you may need to account for both the center-origin shift and the `-90°` WPILOG rotation.
 
 ## Practical Recommendations
 

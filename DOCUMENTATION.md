@@ -9,23 +9,27 @@ This repository tracks the four robots in an FTC match video, projects them into
 3. Inspect the CSV, WPILOG, background image, and optional debug frames.
 4. If needed, produce supervised manual labels with the browser-based manual tracker and reuse them to tune identity assignment.
 
-The repo currently contains four user-facing tools:
+The repo currently contains several user-facing tools:
 
 - `auto_scout.py`: main automatic tracker.
-- `calibrate.py`: interactive corner picker that produces `field_corners.json`.
-- `manual_tracker.html`: browser UI for hand-labeling robot poses and exporting CSV/JSON.
-- `debug.py`: small utility that prints the structure of a generated WPILOG.
+- `tools/calibrate.py`: interactive corner picker that produces `field_corners.json`.
+- `tools/manual_tracker.html`: browser UI for hand-labeling robot poses and exporting CSV/JSON.
+- `tools/debug.py`: small utility that prints the structure of a generated WPILOG.
+- `tools/data_visualizer.html`: browser UI for inspecting exported robot tracks.
+- `tools/shot_visualizer.html`: browser UI for inspecting shot events.
 
 ## Repository Layout
 
 - `auto_scout.py`: full tracking pipeline, exports, and CLI.
-- `calibrate.py`: manual field calibration tool.
-- `manual_tracker.html`: no-build manual annotation app.
-- `debug.py`: WPILOG inspection helper.
-- `field_corners.json`: example/manual calibration file.
-- `output/`, `output_mergefix/`: example output directories.
-- `manual_robot_positions.csv`: example hand-labeled robot CSV.
-- `README.md`: short quickstart; `DOCUMENTATION.md` is the full reference.
+- `tools/`: helper scripts and no-build browser tools.
+  Includes `calibrate.py`, `debug.py`, `manual_tracker.html`, `data_visualizer.html`, and `shot_visualizer.html`.
+- `assets/`: static images used by the project and docs.
+- `examples/`: local sample videos for testing.
+- `output/`: default generated outputs.
+- `field_corners.json`: local calibration JSON in the repo root.
+- `README.md`: short quickstart.
+- `DOCUMENTATION.md`: full reference.
+- `AUTOSCOUT_PAPER.tex`: paper-style technical writeup.
 
 ## Dependencies
 
@@ -73,7 +77,7 @@ Implementation detail:
 
 - the tracker still keeps its internal homography and state on the historical `0..144` field plane
 - external interfaces and outputs are converted by subtracting `72` inches from both axes
-- WPILOG adds one extra transform on export: it rotates the pose frame by `-90°` relative to the CSV/public field frame
+- WPILOG adds one extra viewer-facing export transform on top of the center-origin shift and inches-to-meters conversion
 
 ### Robot IDs
 
@@ -97,7 +101,7 @@ When a robot temporarily disappears, the tracker can keep its last position aliv
 1. Generate field corners:
 
 ```bash
-python3 calibrate.py match.mp4
+python3 tools/calibrate.py match.mp4
 ```
 
 2. Track the video:
@@ -132,8 +136,8 @@ This bypasses the normal blob-based bootstrap step.
 
 ### Workflow 4: Build supervised re-ID references
 
-1. Label a match manually with `manual_tracker.html`.
-2. Export `manual_robot_positions.csv`.
+1. Label a match manually with `tools/manual_tracker.html`.
+2. Export a manual robot CSV, for example `manual_robot_positions.csv`.
 3. Re-run the tracker with:
 
 ```bash
@@ -160,7 +164,8 @@ Flags:
 - `--start-offset`: seconds skipped before the match timer starts. Default `0.0`.
 - `--sample-rate`: intended processed FPS. Default `10.0`.
 - `--debug`: saves annotated debug frames to `tracker_debug/`.
-- `--debug-every`: save one debug frame every N source frames. Default `5`.
+- `--debug-video`: writes annotated debug output to `tracker_debug.mp4` instead of `tracker_debug/` images. Implies `--debug`.
+- `--debug-every`: save one debug frame every N processed frames. Default `1`.
 - `--debug-enable-hitboxes`: draws wireframe robot hitboxes in debug frames.
 - `--no-download`: use a local video instead of YouTube.
 - `--video-path`: local video path. Requires `--no-download`.
@@ -186,6 +191,7 @@ Each run writes:
 - `match_log.wpilog`: AdvantageScope-compatible output.
 - `median_background.jpg`: median background used for subtraction.
 - `tracker_debug/`: optional annotated frames when `--debug` is enabled.
+- `tracker_debug.mp4`: optional annotated debug video when `--debug-video` is enabled.
 
 `robot_positions.csv` now also carries shot events:
 
@@ -230,9 +236,9 @@ Pose entries are written as `x_m`, `y_m`, and `heading_rad`.
 
 Important note:
 
-- the WPILOG coordinates are center-origin and also rotated by `-90°` relative to the CSV field frame
-- specifically, the exporter writes `x' = y`, `y' = -x`, and `heading' = heading - π/2`
-- if you compare CSV positions directly against AdvantageScope positions, expect this rotation difference
+- the WPILOG coordinates are center-origin and use a viewer-facing axis remap relative to the CSV field frame
+- specifically, the exporter writes `x' = y`, `y' = x`, and `heading' = π/2 - heading`
+- if you compare CSV positions directly against AdvantageScope positions, expect this axis-remap difference
 
 ## Processing Pipeline
 
@@ -662,16 +668,16 @@ Important limitations:
 - it can miss shots that are heavily occluded or merge into other colored objects
 - it can confuse unusual passes or fast ball-handling events with shots if the trajectory looks goal-directed
 
-## `calibrate.py`
+## `tools/calibrate.py`
 
-`calibrate.py` is the preferred way to generate `field_corners.json`.
+`tools/calibrate.py` is the preferred way to generate `field_corners.json`.
 
 Usage:
 
 ```bash
-python3 calibrate.py match.mp4
-python3 calibrate.py match.mp4 --output my_corners.json
-python3 calibrate.py match.mp4 --frame 900
+python3 tools/calibrate.py match.mp4
+python3 tools/calibrate.py match.mp4 --output my_corners.json
+python3 tools/calibrate.py match.mp4 --frame 900
 ```
 
 What it does:
@@ -697,7 +703,7 @@ Internal details:
 - the editor shows corners as `TL`, `TR`, `BR`, `BL`
 - on save it converts from display order `[TL, TR, BR, BL]` to tracker order `[BL, BR, TR, TL]`
 
-## `manual_tracker.html`
+## `tools/manual_tracker.html`
 
 This file is a standalone browser-based manual annotation tool. It is meant for creating ground-truth robot pose labels, especially when:
 
@@ -707,7 +713,7 @@ This file is a standalone browser-based manual annotation tool. It is meant for 
 
 ### How to use it
 
-1. Open `manual_tracker.html` in a browser.
+1. Open `tools/manual_tracker.html` in a browser.
 2. Load a video file.
 3. Load `field_corners.json`.
 4. Select a robot (`R0` to `R3`).
@@ -786,9 +792,9 @@ It solves an 8x8 linear system for a 3x3 projective transform with `h33 = 1`, th
 
 Like the Python tracker, the browser tool keeps the homography on the historical `0..144` field plane internally, then converts to or from center-origin coordinates by shifting each axis by `72` inches.
 
-## `debug.py`
+## `tools/debug.py`
 
-`debug.py` is a small inspection helper for generated WPILOG files.
+`tools/debug.py` is a small inspection helper for generated WPILOG files.
 
 It:
 
@@ -798,6 +804,11 @@ It:
 - prints the first few data records in decoded form
 
 This is useful when validating whether the logger is writing the expected pose and visibility channels.
+
+## Other Browser Tools
+
+- `tools/data_visualizer.html`: browser-based viewer for exported robot-position CSVs.
+- `tools/shot_visualizer.html`: browser-based viewer focused on shot-event inspection.
 
 ## File Formats
 
@@ -936,16 +947,16 @@ To visualize the WPILOG:
 5. Drag `Robot0/Pose` through `Robot3/Pose` into the pose list.
 6. Ensure the display expects meters and radians.
 
-The WPILOG writer converts centered inches to meters before logging and applies a `-90°` pose rotation relative to the CSV/public field frame.
+The WPILOG writer converts centered inches to meters before logging and then remaps the center-origin field axes for WPILOG viewing: `x' = y`, `y' = x`, and `heading' = π/2 - heading`.
 
-If your viewer assumes a different field orientation, you may need to account for both the center-origin shift and the `-90°` WPILOG rotation.
+If your viewer assumes a different field orientation, you may need to account for both the center-origin shift and this WPILOG axis remap.
 
 ## Practical Recommendations
 
-- Use `calibrate.py` for every materially different camera angle or crop.
+- Use `tools/calibrate.py` for every materially different camera angle or crop.
 - Prefer local video plus `--corners` over relying on automatic field detection.
 - Turn on `--debug` whenever you are tuning thresholds or investigating identity swaps.
-- Use `manual_tracker.html` when you need truth data instead of guessing from tracker output.
+- Use `tools/manual_tracker.html` when you need truth data instead of guessing from tracker output.
 - Install `scipy`; the Hungarian assignment is better than the greedy fallback.
 
 ## Summary

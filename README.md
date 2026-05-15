@@ -5,7 +5,7 @@
 | -------- | -------- |
 | rayID Designation | RE-016236-08 |
 
-*This project is developed by **Ray Enterprises' Advanced Research and Experimental Development Division** (ARED) for use by FTC Team Juice 16236.*
+*This project is developed by **Ray Enterprises' R&D** (ARED) for use by FTC Team Juice 16236.*
 
 ## About AutoScout
 `auto_scout.py` tracks the four robots in an FTC match video, projects them into field coordinates, and exports the result for later analysis.
@@ -14,6 +14,7 @@ Current outputs are focused on robot motion:
 - `robot_positions.csv` for per-timestamp robot poses and visibility
 - `match_log.wpilog` for AdvantageScope playback
 - optional annotated debug frames in `output/tracker_debug/`
+- optional annotated debug video in `output/tracker_debug.mp4`
 
 The CSV now also includes per-robot shot-event columns:
 
@@ -61,10 +62,11 @@ python3 auto_scout.py "https://www.youtube.com/watch?v=..."
 | `--start-offset` | `float` | `0.0` | Seconds to skip before the match timer starts |
 | `--sample-rate` | `float` | `10.0` | Effective frames per second to process |
 | `--debug` | - | disabled | Save annotated debug frames to `tracker_debug/` |
-| `--debug-every` | `int` | `5` | Save one debug frame about every `N` source-video frames |
+| `--debug-video` | - | disabled | Write annotated debug output to `tracker_debug.mp4` instead of `tracker_debug/` images. Implies `--debug` |
+| `--debug-every` | `int` | `1` | Save one debug frame every `N` processed frames |
 | `--no-download` | - | disabled | Use a local video instead of downloading from YouTube |
 | `--video-path` | `string` | `None` | Path to the local match video. Requires `--no-download` |
-| `--corners` | `string` | `None` | Path to `field_corners.json` from `calibrate.py` |
+| `--corners` | `string` | `None` | Path to `field_corners.json` from `tools/calibrate.py` |
 | `--robot-init-positions` | `json` | `None` | Four starting field coordinates in inches, using center-origin coordinates |
 | `--manual-reference-csv` | `string` | `None` | Manual `robot_positions`-style CSV in the same center-origin coordinate system |
 
@@ -74,10 +76,27 @@ AutoScout can try to detect the field outline automatically, but manual calibrat
 Generate field corners from a local video:
 
 ```bash
-python3 calibrate.py path/to/match.mp4
+python3 tools/calibrate.py path/to/match.mp4
 ```
 
 That produces a `field_corners.json` file. Pass it to `auto_scout.py` with `--corners`. Recalibrate whenever the camera angle or crop changes.
+
+## Repository Layout
+
+- `auto_scout.py`
+  Main tracker CLI and export pipeline.
+- `tools/`
+  Helper scripts and browser UIs: `calibrate.py`, `debug.py`, `manual_tracker.html`, `data_visualizer.html`, and `shot_visualizer.html`.
+- `assets/`
+  Static project images.
+- `examples/`
+  Example local videos for testing and manual workflows.
+- `output/`
+  Default generated outputs such as CSV, WPILOG, background images, and debug media.
+- `field_corners.json`
+  A local calibration file in the repo root. You can also generate other corner JSON files and pass them with `--corners`.
+- `README.md`, `DOCUMENTATION.md`, `AUTOSCOUT_PAPER.tex`
+  Quickstart, full reference, and the paper-style writeup.
 
 ## Outputs
 When a run finishes, the output directory typically contains:
@@ -85,14 +104,17 @@ When a run finishes, the output directory typically contains:
 - `robot_positions.csv`
   Flat table of timestamped robot positions, headings, visibility flags, and shot events. `x/y` are in inches from field center.
 - `match_log.wpilog`
-  WPILOG output using center-origin coordinates converted to meters and rotated by `-90°` relative to the CSV field frame.
+  WPILOG output using center-origin coordinates converted to meters with the viewer-facing axis remap `x' = y`, `y' = x`, and `heading' = π/2 - heading`.
 - `median_background.jpg`
   The median background image used for subtraction.
 - `tracker_debug/`
   Optional annotated frames showing contours, split centers, merge annotations, and robot IDs.
+- `tracker_debug.mp4`
+  Optional annotated debug video written when `--debug-video` is enabled.
 
 ## Debug Notes
-- `--debug-every` is based on source-video frame spacing, not processed-frame count.
+- `--debug-every` is based on processed-frame spacing. The default `1` saves every processed frame.
+- `--debug-video` writes only the sampled debug frames into the video, so playback speed is based on the debug sampling cadence rather than real-time source-video timing.
 - Merge debug behavior can also be influenced by the top-level `SAVE_ALL_DEBUG_AROUND_MERGES` flag in `auto_scout.py`.
 - Each debug run clears old `.jpg` files from `output/tracker_debug/` before writing new ones.
 
@@ -106,7 +128,7 @@ To inspect the resulting WPILOG:
 5. Drag each `Robot#/Pose` entry into the field poses list.
 
 ## Contributing
-Please open a focused pull request with a clear explanation of the change. Avoid bundling unrelated fixes into a single PR.
+See `CONTRIBUTING.md` for setup, validation, and pull request guidelines.
 
 ## License
 This project is licensed under the MIT license, please see `LICENSE` for more information.

@@ -1,47 +1,5 @@
-# -*- coding: utf-8 -*-
-"""
-auto_scout.py — FTC DECODE robot tracker  (v3.2)
-
-Base: v3.1 topology-based merge tracking.
-Changes in v3.2 — multi-robot merge fixes only:
-
-  PROBLEM: When 3 or 4 robots merge and rearrange while overlapping, the
-  tracker incorrectly reassigns IDs after separation because:
-    (a) peak_assignment used predicted positions that drift away from the
-        blob centroid during long merges (velocity extrapolation on frozen tracks)
-    (b) no permutation/crossing tracking for 3+ merges (only 2-robot case
-        had the "crossed" flip)
-    (c) if the dist-transform peak extractor returned <expected peaks for
-        even one frame, peak_assignment went stale without a fallback
-    (d) after separation, re-anchoring used the last frame's peak positions
-        which are the exit positions of the blob boundary — not where the
-        robots actually are heading
-
-  FIXES:
-
-  e) PEAK-ANCHORED POSITION during merge — while 3+ robots are merged,
-     their in-merge position is continuously updated to the nearest dist-
-     transform peak (like _update_crossing already does for 3+), so velocity
-     and position state track the peak rather than freezing at entry.
-     This makes _predict_image_pos work correctly during the merge.
-
-  f) PERMUTATION TRACKING for 3+ merges — MergeGroup now stores
-     `entry_order` (the sorted track IDs at merge-start) and `current_order`
-     (updated every frame from peak assignments sorted along entry_axis).
-     On separation, the mapping entry_order[k] → current_order[k] gives the
-     correct post-merge ID assignment, analogous to `crossed` for 2-robots.
-
-  g) STALE PEAK GUARD — if _split_contour returns fewer peaks than tracks in
-     the merge group, we fall back to the last good peak_assignment rather
-     than silently doing nothing. This prevents the permutation state from
-     freezing mid-rearrangement.
-
-  h) SEPARATION RE-ANCHOR uses the permutation map to swap track state
-     (pos, vel, pos_px, vel_px) so each logical robot ID ends up owning the
-     correct physical position after the merge resolves.
-"""
-
 import argparse
+import builtins
 import csv
 import itertools
 import json
@@ -57,6 +15,130 @@ SAVE_ALL_DEBUG_AROUND_MERGES = False
 PROCESS_EVERY_SOURCE_FRAME = True
 FIELD_SIZE_IN = 144.0
 FIELD_CENTER_OFFSET_IN = FIELD_SIZE_IN / 2.0
+ANSI_RESET = "\033[0m"
+ANSI_STYLES = {
+    "info": "\033[1;36m",
+    "warn": "\033[1;33m",
+    "error": "\033[1;31m",
+    "done": "\033[1;32m",
+    "path": "\033[0;94m",
+    "shot_made": "\033[1;32m",
+    "shot_missed": "\033[1;31m",
+}
+COLOR_OUTPUT_ENABLED = sys.stdout.isatty() and os.getenv("NO_COLOR") is None
+_ACTIVE_PROGRESS_BAR = None
+
+
+def _ansi(style: str, text: str) -> str:
+    if not COLOR_OUTPUT_ENABLED:
+        return text
+    code = ANSI_STYLES.get(style)
+    if not code:
+        return text
+    return "{}{}{}".format(code, text, ANSI_RESET)
+
+
+def _style_console_text(text: str) -> str:
+    if not COLOR_OUTPUT_ENABLED or not isinstance(text, str):
+        return text
+
+    stripped = text.lstrip("\r\n")
+    prefix = text[:len(text) - len(stripped)]
+
+    tag_styles = {
+        "[INFO]": "info",
+        "[WARN]": "warn",
+        "[ERROR]": "error",
+        "[DONE]": "done",
+    }
+    for tag, style in tag_styles.items():
+        if stripped.startswith(tag):
+            stripped = _ansi(style, tag) + stripped[len(tag):]
+            break
+
+    if "Shot made by" in stripped:
+        stripped = stripped.replace("Shot made by", "{} made by".format(
+            _ansi("shot_made", "Shot")), 1)
+    elif "Shot missed by" in stripped:
+        stripped = stripped.replace("Shot missed by", "{} missed by".format(
+            _ansi("shot_missed", "Shot")), 1)
+
+    if stripped.startswith("  CSV:"):
+        stripped = "  CSV:    {}".format(_ansi("path", stripped.split("CSV:", 1)[1].strip()))
+    elif stripped.startswith("  WPILOG:"):
+        stripped = "  WPILOG: {}".format(_ansi("path", stripped.split("WPILOG:", 1)[1].strip()))
+    elif stripped.startswith("  Debug:"):
+        stripped = "  Debug:  {}".format(_ansi("path", stripped.split("Debug:", 1)[1].strip()))
+
+    return prefix + stripped
+
+
+def _console_print(*args, **kwargs):
+    sep = kwargs.pop("sep", " ")
+    end = kwargs.pop("end", "\n")
+    file = kwargs.pop("file", None)
+    flush = kwargs.pop("flush", False)
+    if kwargs:
+        raise TypeError("Unsupported print kwargs: {}".format(", ".join(sorted(kwargs.keys()))))
+    if file is None:
+        file = sys.stdout
+    text = sep.join(str(arg) for arg in args)
+    if file in (sys.stdout, sys.stderr):
+        text = _style_console_text(text)
+    if _ACTIVE_PROGRESS_BAR is not None and file in (sys.stdout, sys.stderr):
+        _clear_active_progress_bar()
+    builtins.print(text, end=end, file=file, flush=flush)
+    if _ACTIVE_PROGRESS_BAR is not None and file in (sys.stdout, sys.stderr):
+        _redraw_active_progress_bar()
+
+
+print = _console_print
+
+
+def _clear_active_progress_bar():
+    bar = _ACTIVE_PROGRESS_BAR
+    if bar is None:
+        return
+    file = getattr(bar, "file", None)
+    is_tty = getattr(bar, "is_tty", None)
+    if file is None or not callable(is_tty) or not is_tty():
+        return
+    width = max(0, int(getattr(bar, "_max_width", 0)))
+    if width > 0:
+        builtins.print("\r{}\r".format(" " * width), end="", file=file, flush=True)
+    else:
+        builtins.print("\r", end="", file=file, flush=True)
+
+
+def _redraw_active_progress_bar():
+    bar = _ACTIVE_PROGRESS_BAR
+    if bar is None:
+        return
+    update = getattr(bar, "update", None)
+    if callable(update):
+        update()
+
+
+class _ManagedBar:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def next(self, n=1):
+        return self._inner.next(n)
+
+    def update(self):
+        return self._inner.update()
+
+    def finish(self):
+        global _ACTIVE_PROGRESS_BAR
+        try:
+            return self._inner.finish()
+        finally:
+            if _ACTIVE_PROGRESS_BAR is self:
+                _ACTIVE_PROGRESS_BAR = None
 
 
 def _require(package, pip_name=None):
@@ -70,25 +152,49 @@ def _require(package, pip_name=None):
 
 
 def _make_bar(label, max_val):
+    global _ACTIVE_PROGRESS_BAR
     try:
         from progress.bar import Bar
-        return Bar(label, max=max_val,
-                   suffix="%(percent).0f%% %(elapsed_td)s ETA %(eta_td)s")
+        bar = _ManagedBar(Bar(
+            label,
+            max=max_val,
+            suffix="%(percent).0f%% %(elapsed_td)s ETA %(eta_td)s",
+        ))
+        _ACTIVE_PROGRESS_BAR = bar
+        return bar
     except ImportError:
         class _FallbackBar:
             def __init__(self, lbl, total):
-                self._lbl   = lbl
+                self._lbl = lbl
                 self._total = max(total, 1)
-                self._n     = 0
-                print("[{}] 0%".format(lbl), end="", flush=True)
+                self._n = 0
+                self.file = sys.stdout
+                self._max_width = 0
+                self._render()
+
+            def is_tty(self):
+                return self.file.isatty()
+
+            def _render(self):
+                pct = int(self._n / self._total * 100)
+                line = "[{}] {}%".format(self._lbl, pct)
+                self._max_width = max(self._max_width, len(line))
+                builtins.print("\r{}".format(line), end="", file=self.file, flush=True)
+
             def next(self):
                 self._n += 1
-                pct = int(self._n / self._total * 100)
                 if self._n % max(1, self._total // 20) == 0 or self._n == self._total:
-                    print("\r[{}] {}%".format(self._lbl, pct), end="", flush=True)
+                    self._render()
+
+            def update(self):
+                self._render()
+
             def finish(self):
-                print()
-        return _FallbackBar(label, max_val)
+                builtins.print(file=self.file, flush=True)
+
+        bar = _ManagedBar(_FallbackBar(label, max_val))
+        _ACTIVE_PROGRESS_BAR = bar
+        return bar
 
 
 def _field_corner_to_center_xy(x_in: float, y_in: float) -> Tuple[float, float]:
@@ -185,10 +291,10 @@ class RobotPose:
     def wpilog_x_m(self): return self.y_center_in * 0.0254
 
     @property
-    def wpilog_y_m(self): return -self.x_center_in * 0.0254
+    def wpilog_y_m(self): return self.x_center_in * 0.0254
 
     @property
-    def wpilog_heading_rad(self): return _normalize_angle_rad(self.heading - (math.pi / 2.0))
+    def wpilog_heading_rad(self): return _normalize_angle_rad((math.pi / 2.0) - self.heading)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -254,10 +360,14 @@ class BallTrack:
     missing_frames: int = 0
     launched: bool = False
     shooter_id: Optional[int] = None
+    shooter_img: Optional[Tuple[float, float]] = None
     shooter_dist_px: Optional[float] = None
     shooter_pos_center_in: Optional[Tuple[float, float]] = None
     goal_color: str = ""
     entered_goal: bool = False
+    entered_goal_frames: int = 0
+    first_goal_entry_frame: Optional[int] = None
+    last_goal_entry_point: Optional[Tuple[float, float]] = None
     approached_goal: bool = False
     resolved: bool = False
 
@@ -271,19 +381,26 @@ class BallTrack:
 
 
 class ShotDetector:
-    BALL_MIN_CONTOUR_AREA_PX = 14.0
+    BALL_MIN_CONTOUR_AREA_PX = 8.0
     BALL_MAX_CONTOUR_AREA_PX = 420.0
     BALL_ASSOC_DIST_PX = 34.0
-    BALL_ASSOC_DIST_FAST_PX = 82.0
-    BALL_MAX_MISSING = 5
-    SHOT_MAX_START_DIST_PX = 46.0
-    SHOT_MIN_DISP_PX = 18.0
-    SHOT_MIN_SPEED_PX = 5.0
-    SHOT_MIN_UPWARD_PX = 8.0
-    SHOT_MIN_LIFE_FRAMES = 3
+    BALL_ASSOC_DIST_FAST_PX = 124.0
+    BALL_MAX_MISSING = 12
+    SHOT_MAX_START_DIST_PX = 84.0
+    SHOT_MIN_DISP_PX = 8.0
+    SHOT_MIN_SPEED_PX = 2.0
+    SHOT_MIN_UPWARD_PX = 3.0
+    SHOT_MIN_LIFE_FRAMES = 2
+    SHOT_MIN_NEGATIVE_STEP_RATIO = 0.35
+    SHOT_MIN_AWAY_FROM_SHOOTER_PX = 2.0
+    SHOT_DEDUP_TIME_S = 0.35
     GOAL_OPENING_TOP_FRAC = 0.58
     GOAL_APPROACH_SIDE_PAD_FRAC = 0.30
     GOAL_APPROACH_DOWN_FRAC = 0.95
+    GOAL_CONFIRM_MIN_FRAMES = 2
+    GOAL_ENTRY_MAX_MISSING = 5
+    GOAL_OPENING_SHRINK_X = 0.84
+    GOAL_OPENING_SHRINK_Y = 0.80
     GOAL_BLUE_HSV_LO = (95, 80, 45)
     GOAL_BLUE_HSV_HI = (135, 255, 255)
     GOAL_RED1_HSV_LO = (0, 90, 45)
@@ -298,6 +415,7 @@ class ShotDetector:
         self._tracks: Dict[int, BallTrack] = {}
         self._goal_openings: Dict[str, object] = {}
         self._goal_approaches: Dict[str, object] = {}
+        self._last_event_time_by_robot: Dict[int, float] = {}
         self._ready = False
 
     def setup(self, tracker) -> None:
@@ -331,10 +449,10 @@ class ShotDetector:
             if not track.samples or track.resolved:
                 continue
             self._update_goal_state(track)
-            self._maybe_mark_launched(track)
+            self._maybe_mark_launched(track, robot_refs)
             if track.missing_frames > self.BALL_MAX_MISSING:
                 event = self._resolve_track(track, frame_num, match_time_s)
-                if event is not None:
+                if event is not None and not self._is_duplicate_event(event):
                     events.append(event)
                 del self._tracks[track.track_id]
         return events
@@ -427,17 +545,20 @@ class ShotDetector:
             cx, cy, _area = detections[di]
             nearest_id = None
             nearest_dist = None
+            nearest_img = None
             nearest_center = None
             for ref in robot_refs:
                 dist = math.hypot(cx - ref["img"][0], cy - ref["img"][1])
                 if nearest_dist is None or dist < nearest_dist:
                     nearest_dist = dist
                     nearest_id = ref["id"]
+                    nearest_img = ref["img"]
                     nearest_center = ref["center"]
             self._tracks[self._next_track_id] = BallTrack(
                 track_id=self._next_track_id,
                 samples=[(frame_num, cx, cy)],
                 shooter_id=nearest_id,
+                shooter_img=nearest_img,
                 shooter_dist_px=nearest_dist,
                 shooter_pos_center_in=nearest_center,
             )
@@ -452,7 +573,7 @@ class ShotDetector:
         return x1 + (x1 - x0), y1 + (y1 - y0)
 
     def _update_goal_state(self, track: BallTrack) -> None:
-        _f, x, y = track.samples[-1]
+        frame_idx, x, y = track.samples[-1]
         for color, poly in self._goal_approaches.items():
             if self.cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0:
                 track.approached_goal = True
@@ -461,19 +582,22 @@ class ShotDetector:
         for color, poly in self._goal_openings.items():
             if self.cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0:
                 track.entered_goal = True
+                track.entered_goal_frames += 1
+                if track.first_goal_entry_frame is None:
+                    track.first_goal_entry_frame = frame_idx
+                track.last_goal_entry_point = (float(x), float(y))
                 track.goal_color = color
                 break
 
-    def _maybe_mark_launched(self, track: BallTrack) -> None:
+    def _maybe_mark_launched(self, track: BallTrack, robot_refs) -> None:
         if track.launched or len(track.samples) < self.SHOT_MIN_LIFE_FRAMES:
-            return
-        if track.shooter_id is None or track.shooter_dist_px is None:
-            return
-        if track.shooter_dist_px > self.SHOT_MAX_START_DIST_PX:
             return
         first = track.first_point
         last = track.last_point
         if first is None or last is None:
+            return
+        shooter_ref, shooter_score = self._select_shooter(track, robot_refs)
+        if shooter_ref is None or shooter_score > self.SHOT_MAX_START_DIST_PX:
             return
         f0, x0, y0 = first
         f1, x1, y1 = last
@@ -484,12 +608,20 @@ class ShotDetector:
             return
         if (y1 - y0) > -self.SHOT_MIN_UPWARD_PX:
             return
+        if not self._has_consistent_upward_motion(track):
+            return
+        if not self._moving_away_from_shooter(track):
+            return
+        track.shooter_id = shooter_ref["id"]
+        track.shooter_img = shooter_ref["img"]
+        track.shooter_dist_px = shooter_score
+        track.shooter_pos_center_in = shooter_ref["center"]
         track.launched = True
 
     def _resolve_track(self, track: BallTrack, frame_num: int, match_time_s: float) -> Optional[ShotEvent]:
         if not track.launched or track.shooter_id is None or track.shooter_pos_center_in is None:
             return None
-        if track.entered_goal:
+        if self._confirmed_goal_make(track):
             result = "made"
         elif track.approached_goal or self._track_reached_top(track):
             result = "missed"
@@ -506,6 +638,91 @@ class ShotDetector:
             timestamp_s=match_time_s,
             goal_color=track.goal_color,
         )
+
+    def _has_consistent_upward_motion(self, track: BallTrack) -> bool:
+        if len(track.samples) < 3:
+            return False
+        negative_steps = 0
+        total_steps = 0
+        for (_f0, _x0, y0), (_f1, _x1, y1) in zip(track.samples[:-1], track.samples[1:]):
+            total_steps += 1
+            if y1 < y0:
+                negative_steps += 1
+        return total_steps > 0 and (negative_steps / total_steps) >= self.SHOT_MIN_NEGATIVE_STEP_RATIO
+
+    def _select_shooter(self, track: BallTrack, robot_refs):
+        if not robot_refs:
+            return None, float("inf")
+        first = track.first_point
+        if first is None:
+            return None, float("inf")
+        _f0, x0, y0 = first
+        origin_x, origin_y = x0, y0
+        if len(track.samples) >= 2:
+            deltas = []
+            for (_fa, xa, ya), (_fb, xb, yb) in zip(track.samples[:-1], track.samples[1:]):
+                deltas.append((xb - xa, yb - ya))
+                if len(deltas) >= 3:
+                    break
+            if deltas:
+                avg_dx = sum(dx for dx, _dy in deltas) / len(deltas)
+                avg_dy = sum(dy for _dx, dy in deltas) / len(deltas)
+                origin_x = x0 - 1.35 * avg_dx
+                origin_y = y0 - 1.35 * avg_dy
+
+        best_ref = None
+        best_score = float("inf")
+        for ref in robot_refs:
+            rx, ry = ref["img"]
+            dist_origin = math.hypot(origin_x - rx, origin_y - ry)
+            dist_first = math.hypot(x0 - rx, y0 - ry)
+            above_penalty = max(0.0, (y0 - ry) - 6.0) * 0.75
+            score = 0.7 * dist_origin + 0.3 * dist_first + above_penalty
+            if score < best_score:
+                best_score = score
+                best_ref = ref
+        return best_ref, best_score
+
+    def _moving_away_from_shooter(self, track: BallTrack) -> bool:
+        if track.shooter_img is None or len(track.samples) < 2:
+            return False
+        first = track.first_point
+        last = track.last_point
+        if first is None or last is None:
+            return False
+        sx, sy = track.shooter_img
+        _f0, x0, y0 = first
+        _f1, x1, y1 = last
+        start_dist = math.hypot(x0 - sx, y0 - sy)
+        last_dist = math.hypot(x1 - sx, y1 - sy)
+        return last_dist >= start_dist + self.SHOT_MIN_AWAY_FROM_SHOOTER_PX
+
+    def _confirmed_goal_make(self, track: BallTrack) -> bool:
+        if not track.entered_goal:
+            return False
+        if track.entered_goal_frames >= self.GOAL_CONFIRM_MIN_FRAMES:
+            return True
+        if track.first_goal_entry_frame is None:
+            return False
+        if track.missing_frames <= self.GOAL_ENTRY_MAX_MISSING and self._track_finished_inside_goal(track):
+            return True
+        return False
+
+    def _track_finished_inside_goal(self, track: BallTrack) -> bool:
+        if not track.goal_color or track.last_goal_entry_point is None:
+            return False
+        poly = self._goal_openings.get(track.goal_color)
+        if poly is None:
+            return False
+        x, y = track.last_goal_entry_point
+        return self.cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0
+
+    def _is_duplicate_event(self, event: ShotEvent) -> bool:
+        last_time = self._last_event_time_by_robot.get(event.shooter_id)
+        if last_time is not None and (event.timestamp_s - last_time) < self.SHOT_DEDUP_TIME_S:
+            return True
+        self._last_event_time_by_robot[event.shooter_id] = event.timestamp_s
+        return False
 
     def _track_reached_top(self, track: BallTrack) -> bool:
         if not track.samples:
@@ -577,7 +794,11 @@ class ShotDetector:
                 hull = cv2.convexHull(top_pts.reshape(-1, 1, 2).astype(np.int32))
             else:
                 hull = cv2.convexHull(chosen)
-            openings[color] = hull
+            openings[color] = self._shrink_polygon(
+                hull,
+                shrink_x=self.GOAL_OPENING_SHRINK_X,
+                shrink_y=self.GOAL_OPENING_SHRINK_Y,
+            )
         return openings
 
     def _fallback_goal_openings(self, tracker):
@@ -614,6 +835,15 @@ class ShotDetector:
         ], dtype=self.np.int32)
         return rect.reshape(-1, 1, 2)
 
+    def _shrink_polygon(self, poly, shrink_x: float, shrink_y: float):
+        pts = poly.reshape(-1, 2).astype(self.np.float32)
+        cx = float(self.np.mean(pts[:, 0]))
+        cy = float(self.np.mean(pts[:, 1]))
+        scaled = pts.copy()
+        scaled[:, 0] = cx + (scaled[:, 0] - cx) * shrink_x
+        scaled[:, 1] = cy + (scaled[:, 1] - cy) * shrink_y
+        return self.np.round(scaled).astype(self.np.int32).reshape(-1, 1, 2)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RobotTracker
@@ -648,7 +878,7 @@ class RobotTracker:
     BALL_GREEN_HSV_HI = (100, 255, 255)
     BALL_PURPLE_HSV_LO = (132, 80, 70)
     BALL_PURPLE_HSV_HI = (165, 255, 255)
-    BALL_MIN_FIELD_AREA_IN2 = 5.0
+    BALL_MIN_FIELD_AREA_IN2 = 2.0
     BALL_MASK_OPEN_FRAC = 0.030
     BALL_MASK_CLOSE_FRAC = 0.055
     BALL_MASK_DILATE_FRAC = 0.070
@@ -2424,6 +2654,26 @@ def _draw_wire_cube(cv2, np, dbg, frame, fg_mask, tracker, H_inv,
         cv2.line(dbg, bottom_i[j], top_i[j], color, 2, cv2.LINE_AA)
 
 
+def _open_debug_video_writer(cv2, base_output_dir, frame_size, fps):
+    candidates = [
+        ("tracker_debug.mp4", "mp4v"),
+        ("tracker_debug.mp4", "avc1"),
+        ("tracker_debug.avi", "MJPG"),
+        ("tracker_debug.avi", "XVID"),
+    ]
+    width, height = frame_size
+    attempted = []
+    for filename, codec in candidates:
+        path = os.path.join(base_output_dir, filename)
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
+        if writer.isOpened():
+            return writer, path, codec
+        attempted.append("{} ({})".format(path, codec))
+        writer.release()
+    return None, attempted, None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main processing loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2433,7 +2683,8 @@ def process_match(
     start_offset_sec  = 0.0,
     sample_rate_fps   = 10.0,
     debug             = False,
-    debug_every_n     = 10,
+    debug_video       = False,
+    debug_every_n     = 1,
     debug_enable_hitboxes = False,
     manual_corners_px = None,
     robot_init_positions = None,  # list of 4 [x_in, y_in] center-origin field coords sorted by robot id
@@ -2460,13 +2711,18 @@ def process_match(
     print("[INFO] Processing every {} frames (~{:.1f} fps output)".format(
         frame_step, video_fps / frame_step))
     if debug:
-        print("[INFO] Saving debug frame about every {} source frames".format(debug_every_n))
+        if debug_video:
+            print("[INFO] Writing debug video from frames sampled about every {} source frames".format(
+                debug_every_n))
+        else:
+            print("[INFO] Saving debug frame about every {} source frames".format(debug_every_n))
         if debug_enable_hitboxes:
             print("[INFO] Debug robot wireframe hitboxes enabled.")
 
     csv_path    = os.path.join(output_dir, "robot_positions.csv")
     wpilog_path = os.path.join(output_dir, "match_log.wpilog")
-    debug_dir   = os.path.join(output_dir, "tracker_debug") if debug else None
+    debug_dir   = os.path.join(output_dir, "tracker_debug") if (debug and not debug_video) else None
+    debug_video_path = os.path.join(output_dir, "tracker_debug.mp4") if (debug and debug_video) else None
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
         for name in os.listdir(debug_dir):
@@ -2475,6 +2731,17 @@ def process_match(
                     os.remove(os.path.join(debug_dir, name))
                 except OSError:
                     pass
+    if debug_video_path and os.path.exists(debug_video_path):
+        try:
+            os.remove(debug_video_path)
+        except OSError:
+            pass
+    avi_fallback_path = os.path.join(output_dir, "tracker_debug.avi")
+    if debug_video_path and os.path.exists(avi_fallback_path):
+        try:
+            os.remove(avi_fallback_path)
+        except OSError:
+            pass
 
     log = WPILogWriter(wpilog_path)
     pose_eids = [log.start_entry("Robot{}/Pose".format(i),    "double[]") for i in range(4)]
@@ -2505,6 +2772,24 @@ def process_match(
     if not ret:
         print("[ERROR] Could not read first frame."); sys.exit(1)
     frame_shape = sample_frame.shape
+    debug_writer = None
+    if debug_video_path:
+        debug_h, debug_w = frame_shape[:2]
+        debug_fps = max(1.0, video_fps / max(1, debug_every_n))
+        debug_writer, opened_path_or_attempts, debug_codec = _open_debug_video_writer(
+            cv2,
+            output_dir,
+            (debug_w, debug_h),
+            debug_fps,
+        )
+        if debug_writer is None:
+            print("[ERROR] Could not open debug video for writing. Tried:")
+            for attempt in opened_path_or_attempts:
+                print("  - {}".format(attempt))
+            sys.exit(1)
+        debug_video_path = opened_path_or_attempts
+        print("[INFO] Debug video: {} ({:.2f} fps, codec {})".format(
+            debug_video_path, debug_fps, debug_codec))
 
     if manual_corners_px is not None:
         bl, br, tr, tl = [np.array(c, np.float32) for c in manual_corners_px]
@@ -2632,7 +2917,7 @@ def process_match(
             row += cells
         csv_writer.writerow(row)
 
-        if debug and debug_dir and H_inv is not None:
+        if debug and H_inv is not None and (debug_dir or debug_writer is not None):
             dbg = frame.copy()
             fg_debug = None
             if ordered is not None:
@@ -2741,8 +3026,11 @@ def process_match(
                           or (SAVE_ALL_DEBUG_AROUND_MERGES and
                               (merge_active or merge_debug_hold > 0)))
             if save_debug:
-                cv2.imwrite(os.path.join(debug_dir,
-                            "frame_{:06d}.jpg".format(current_frame_num)), dbg)
+                if debug_writer is not None:
+                    debug_writer.write(dbg)
+                elif debug_dir is not None:
+                    cv2.imwrite(os.path.join(debug_dir,
+                                "frame_{:06d}.jpg".format(current_frame_num)), dbg)
                 if current_frame_num >= next_debug_source_frame:
                     while current_frame_num >= next_debug_source_frame:
                         next_debug_source_frame += base_debug_interval
@@ -2759,12 +3047,14 @@ def process_match(
         processed += 1
 
     bar.finish()
+    if debug_writer is not None:
+        debug_writer.release()
     log.close(); csv_file.close(); cap.release()
     print("\n[DONE] {} frames processed.".format(processed))
     print("  CSV:    {}".format(csv_path))
     print("  WPILOG: {}".format(wpilog_path))
     if debug:
-        print("  Debug:  {}".format(debug_dir))
+        print("  Debug:  {}".format(debug_video_path if debug_video_path else debug_dir))
     _print_instructions()
 
 
@@ -2830,8 +3120,10 @@ def main():
                    help="Frames per second to process (default 10)")
     p.add_argument("--debug",        action="store_true",
                    help="Save annotated debug frames to tracker_debug/")
-    p.add_argument("--debug-every",  type=int, default=5,
-                   help="Save 1 debug frame every N processed frames (default 5)")
+    p.add_argument("--debug-video",  action="store_true",
+                   help="Write annotated debug output to tracker_debug.mp4 instead of tracker_debug/ images; implies --debug")
+    p.add_argument("--debug-every",  type=int, default=1,
+                   help="Save 1 debug frame every N processed frames (default 1)")
     p.add_argument("--debug-enable-hitboxes", action="store_true",
                    help="Draw robot wireframe hitboxes in debug frames")
     p.add_argument("--no-download",  action="store_true")
@@ -2890,7 +3182,8 @@ def main():
         output_dir           = args.output_dir,
         start_offset_sec     = args.start_offset,
         sample_rate_fps      = args.sample_rate,
-        debug                = args.debug,
+        debug                = (args.debug or args.debug_video),
+        debug_video          = args.debug_video,
         debug_every_n        = args.debug_every,
         debug_enable_hitboxes= args.debug_enable_hitboxes,
         manual_corners_px    = corners,

@@ -11,6 +11,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field as dc_field
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
+from util.juice_log import CSV_COLUMNS, ROBOT_POSE_SCHEMA, JuiceLogWriter, csv_row_to_list, read_rows as read_jlog_rows, sniff_jlog
+
 SAVE_ALL_DEBUG_AROUND_MERGES = False
 PROCESS_EVERY_SOURCE_FRAME = True
 FIELD_SIZE_IN = 144.0
@@ -65,6 +67,8 @@ def _style_console_text(text: str) -> str:
 
     if stripped.startswith("  CSV:"):
         stripped = "  CSV:    {}".format(_ansi("path", stripped.split("CSV:", 1)[1].strip()))
+    elif stripped.startswith("  JLOG:"):
+        stripped = "  JLOG:   {}".format(_ansi("path", stripped.split("JLOG:", 1)[1].strip()))
     elif stripped.startswith("  WPILOG:"):
         stripped = "  WPILOG: {}".format(_ansi("path", stripped.split("WPILOG:", 1)[1].strip()))
     elif stripped.startswith("  Debug:"):
@@ -2377,9 +2381,11 @@ def _project_image_points(cv2, np, H_2d, points_px):
     return [(float(p[0]), float(p[1])) for p in field]
 
 
-def _load_manual_pose_rows(csv_path: str):
+def _load_manual_pose_rows(path: str):
+    if sniff_jlog(path):
+        return read_jlog_rows(path)
     rows = []
-    with open(csv_path, newline="") as f:
+    with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append(row)
@@ -2396,7 +2402,7 @@ def _build_manual_reid_histograms(
     cv2, np = tracker.cv2, tracker.np
     rows = _load_manual_pose_rows(manual_reference_csv)
     if not rows:
-        print("[WARN] Manual re-ID reference CSV is empty: {}".format(manual_reference_csv))
+        print("[WARN] Manual re-ID reference file is empty: {}".format(manual_reference_csv))
         return None
 
     refs = {i: [] for i in range(4)}
@@ -2720,6 +2726,7 @@ def process_match(
             print("[INFO] Debug robot wireframe hitboxes enabled.")
 
     csv_path    = os.path.join(output_dir, "robot_positions.csv")
+    jlog_path   = os.path.join(output_dir, "robot_positions.jlog")
     wpilog_path = os.path.join(output_dir, "match_log.wpilog")
     debug_dir   = os.path.join(output_dir, "tracker_debug") if (debug and not debug_video) else None
     debug_video_path = os.path.join(output_dir, "tracker_debug.mp4") if (debug and debug_video) else None
@@ -2749,17 +2756,8 @@ def process_match(
 
     csv_file   = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        "timestamp_s",
-        "robot0_x_in","robot0_y_in","robot0_heading_rad","robot0_visible",
-        "robot1_x_in","robot1_y_in","robot1_heading_rad","robot1_visible",
-        "robot2_x_in","robot2_y_in","robot2_heading_rad","robot2_visible",
-        "robot3_x_in","robot3_y_in","robot3_heading_rad","robot3_visible",
-        "robot0_shot_result","robot0_shot_x_in","robot0_shot_y_in","robot0_shot_goal",
-        "robot1_shot_result","robot1_shot_x_in","robot1_shot_y_in","robot1_shot_goal",
-        "robot2_shot_result","robot2_shot_x_in","robot2_shot_y_in","robot2_shot_goal",
-        "robot3_shot_result","robot3_shot_x_in","robot3_shot_y_in","robot3_shot_goal",
-    ])
+    csv_writer.writerow(CSV_COLUMNS)
+    jlog_writer = JuiceLogWriter(jlog_path, schema=ROBOT_POSE_SCHEMA)
 
     tracker        = RobotTracker(cv2, np)
     shot_detector  = ShotDetector(cv2, np)
@@ -2900,10 +2898,12 @@ def process_match(
             )
             log.write_boolean(vis_eids[i], timestamp_us, p.visible)
 
-        row = ["{:.4f}".format(match_time_s)]
-        for p in poses:
-            row += ["{:.2f}".format(p.x_center_in), "{:.2f}".format(p.y_center_in),
-                    "{:.4f}".format(p.heading), "1" if p.visible else "0"]
+        row = {"timestamp_s": "{:.4f}".format(match_time_s)}
+        for robot_id, p in enumerate(poses):
+            row["robot{}_x_in".format(robot_id)] = "{:.2f}".format(p.x_center_in)
+            row["robot{}_y_in".format(robot_id)] = "{:.2f}".format(p.y_center_in)
+            row["robot{}_heading_rad".format(robot_id)] = "{:.4f}".format(p.heading)
+            row["robot{}_visible".format(robot_id)] = "1" if p.visible else "0"
         shot_cells = [["", "", "", ""] for _ in range(4)]
         for event in shot_events:
             if 0 <= event.shooter_id < 4:
@@ -2913,9 +2913,13 @@ def process_match(
                     "{:.2f}".format(event.shot_y_in),
                     event.goal_color,
                 ]
-        for cells in shot_cells:
-            row += cells
-        csv_writer.writerow(row)
+        for robot_id, cells in enumerate(shot_cells):
+            row["robot{}_shot_result".format(robot_id)] = cells[0]
+            row["robot{}_shot_x_in".format(robot_id)] = cells[1]
+            row["robot{}_shot_y_in".format(robot_id)] = cells[2]
+            row["robot{}_shot_goal".format(robot_id)] = cells[3]
+        csv_writer.writerow(csv_row_to_list(row))
+        jlog_writer.append_row(row)
 
         if debug and H_inv is not None and (debug_dir or debug_writer is not None):
             dbg = frame.copy()
@@ -3049,9 +3053,10 @@ def process_match(
     bar.finish()
     if debug_writer is not None:
         debug_writer.release()
-    log.close(); csv_file.close(); cap.release()
+    log.close(); csv_file.close(); jlog_writer.close(); cap.release()
     print("\n[DONE] {} frames processed.".format(processed))
     print("  CSV:    {}".format(csv_path))
+    print("  JLOG:   {}".format(jlog_path))
     print("  WPILOG: {}".format(wpilog_path))
     if debug:
         print("  Debug:  {}".format(debug_video_path if debug_video_path else debug_dir))
@@ -3142,9 +3147,9 @@ def main():
                        "'[[-52.7,-70.4],[-12.6,53.0],[15.8,60.6],[57.5,-55.7]]'"))
     p.add_argument("--manual-reference-csv", default=None,
                    help=(
-                       "Manual robot_positions-style CSV used to build a supervised "
+                       "Manual robot_positions-style CSV or JLOG used to build a supervised "
                        "appearance re-ID model for this video. "
-                       "CSV coordinates are interpreted with (0,0) at field center. "
+                       "Coordinates are interpreted with (0,0) at field center. "
                        "Useful for tuning tracker identity assignment against "
                        "hand-labeled data."
                    ))

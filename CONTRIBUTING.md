@@ -8,10 +8,14 @@ This repository mixes Python tracking code, browser-based tooling, and documenta
 
 - `auto_scout.py`
   Main tracker CLI, exports, logging, and shot detection.
+- `util/juice_log.py`
+  Shared JUICE LOG schema implementation for compact pose/shot logs.
 - `tools/calibrate.py`
   Manual field-corner calibration tool.
 - `tools/manual_tracker.html`
   Browser-based manual labeling tool.
+- `util/jlog.js`
+  Shared browser-side JLOG encoder/decoder used by the HTML tools.
 - `tools/debug.py`
   WPILOG inspection helper.
 - `tools/data_visualizer.html`, `tools/shot_visualizer.html`
@@ -47,13 +51,13 @@ Run the validation that matches your change.
 For Python changes, at minimum:
 
 ```bash
-python3 -m py_compile auto_scout.py tools/calibrate.py tools/debug.py
+python3 -m py_compile auto_scout.py util/juice_log.py tools/calibrate.py tools/debug.py
 ```
 
 If your change affects tracking, calibration, or exports, also do a realistic manual check when possible:
 
 - run `auto_scout.py` on a local example video
-- verify CSV and WPILOG outputs are created as expected
+- verify CSV, JLOG, and WPILOG outputs are created as expected
 - check any affected debug output
 - open the browser tools if you changed their UI or data flow
 

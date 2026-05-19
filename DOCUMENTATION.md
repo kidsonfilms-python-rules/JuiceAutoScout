@@ -6,14 +6,16 @@ This repository tracks the four robots in an FTC match video, projects them into
 
 1. Calibrate the field corners in the video.
 2. Run the automatic tracker on the calibrated video.
-3. Inspect the CSV, WPILOG, background image, and optional debug frames.
+3. Inspect the CSV, JLOG, WPILOG, background image, and optional debug frames.
 4. If needed, produce supervised manual labels with the browser-based manual tracker and reuse them to tune identity assignment.
 
 The repo currently contains several user-facing tools:
 
 - `auto_scout.py`: main automatic tracker.
+- `util/juice_log.py`: shared Python reader/writer for the compact `robot_positions.jlog` format.
 - `tools/calibrate.py`: interactive corner picker that produces `field_corners.json`.
-- `tools/manual_tracker.html`: browser UI for hand-labeling robot poses and exporting CSV/JSON.
+- `util/jlog.js`: shared browser-side JLOG encoder/decoder.
+- `tools/manual_tracker.html`: browser UI for hand-labeling robot poses and exporting CSV/JLOG/JSON.
 - `tools/debug.py`: small utility that prints the structure of a generated WPILOG.
 - `tools/data_visualizer.html`: browser UI for inspecting exported robot tracks.
 - `tools/shot_visualizer.html`: browser UI for inspecting shot events.
@@ -21,6 +23,8 @@ The repo currently contains several user-facing tools:
 ## Repository Layout
 
 - `auto_scout.py`: full tracking pipeline, exports, and CLI.
+- `util/`: shared cross-tool helpers.
+  Includes `juice_log.py` and `jlog.js`.
 - `tools/`: helper scripts and no-build browser tools.
   Includes `calibrate.py`, `debug.py`, `manual_tracker.html`, `data_visualizer.html`, and `shot_visualizer.html`.
 - `assets/`: static images used by the project and docs.
@@ -70,7 +74,7 @@ The public coordinate system is now center-origin on a normalized 144 x 144 inch
 - `x` increases from left to right.
 - `y` increases from top to bottom in the transformed field plane used by the code.
 - the corners are `(-72, -72)`, `(72, -72)`, `(72, 72)`, and `(-72, 72)` in inches
-- positions are stored in inches in CSV output
+- positions are stored in inches in CSV output and at the same logical scale in JLOG output
 - WPILOG output converts those centered inches to meters using `in * 0.0254`
 
 Implementation detail:
@@ -137,7 +141,7 @@ This bypasses the normal blob-based bootstrap step.
 ### Workflow 4: Build supervised re-ID references
 
 1. Label a match manually with `tools/manual_tracker.html`.
-2. Export a manual robot CSV, for example `manual_robot_positions.csv`.
+2. Export a manual robot CSV or JLOG, for example `manual_robot_positions.csv` or `manual_robot_positions.jlog`.
 3. Re-run the tracker with:
 
 ```bash
@@ -171,7 +175,7 @@ Flags:
 - `--video-path`: local video path. Requires `--no-download`.
 - `--corners`: path to `field_corners.json`.
 - `--robot-init-positions`: JSON file path or inline JSON string of four center-origin `[x, y]` field positions in inches.
-- `--manual-reference-csv`: manual `robot_positions`-style CSV used to build supervised appearance references.
+- `--manual-reference-csv`: manual `robot_positions`-style CSV or JLOG used to build supervised appearance references.
 
 ### Important behavior note about `--sample-rate`
 
@@ -188,14 +192,15 @@ Because of that, `process_match()` forces `frame_step = 1`, so the tracker curre
 Each run writes:
 
 - `robot_positions.csv`: timestamped field poses and visibility flags.
+- `robot_positions.jlog`: compact binary JUICE LOG file for the same tracker table data, with a self-describing schema header.
 - `match_log.wpilog`: AdvantageScope-compatible output.
 - `median_background.jpg`: median background used for subtraction.
 - `tracker_debug/`: optional annotated frames when `--debug` is enabled.
 - `tracker_debug.mp4`: optional annotated debug video when `--debug-video` is enabled.
 
-`robot_positions.csv` now also carries shot events:
+`robot_positions.csv` and `robot_positions.jlog` now also carry shot events:
 
-- per robot, the CSV records when AutoScout resolves a shot as `made` or `missed`
+- per robot, the pose log records when AutoScout resolves a shot as `made` or `missed`
 - the recorded shot position is the shooter's field position in center-origin inches
 - the row is populated on the frame where the shot result becomes known
 
@@ -224,6 +229,67 @@ Notes:
 - `robotN_shot_result` is blank on most rows and becomes `made` or `missed` when a shot resolves.
 - `robotN_shot_x_in` / `robotN_shot_y_in` are the shooter's position in center-origin inches.
 - `robotN_shot_goal` is the goal opening the detector associated the shot with, currently `red` or `blue`.
+
+## JUICE LOG (.jlog)
+
+`robot_positions.jlog` is a compact binary JUICE LOG container designed for append-style writing, partial-write recovery, and schema evolution. The current tracker writes pose and shot columns that correspond to the CSV output, but the format itself is not limited to that specific table.
+
+Key properties:
+
+- the file begins with a self-describing schema header
+- current files are written as JLOG v2 and readers still accept legacy v1 files
+- future compatible additions are expected to happen through minor-version changes and per-column schema metadata
+- pose rows are stored in independent CRC-checked blocks
+- if writing stops halfway through a block, previously completed blocks remain readable
+- values are quantized before storage for size reduction
+
+Current tracker schema:
+
+- `timestamp_s`: stored as integer milliseconds
+- `robotN_x_in`, `robotN_y_in`, `robotN_shot_x_in`, `robotN_shot_y_in`: stored in hundredths of an inch
+- `robotN_heading_rad`: stored in `1e-4` radians
+- `robotN_visible`: stored as packed booleans
+- string fields such as shot result and goal are stored through block-local string dictionaries
+
+Header layout:
+
+- 8 bytes: file magic `JLOGv002`
+- 2 bytes: major version
+- 2 bytes: minor version
+- 4 bytes: target rows per block
+- 4 bytes: schema byte length
+- schema bytes:
+  column count, then one descriptor per column
+
+Each column descriptor currently includes:
+
+- column name
+- storage kind such as `scaled_int`, `bool`, `string`, `int`, or `float64`
+- optional unit string such as `s`, `in`, or `rad`
+- numeric scale when the kind is `scaled_int`
+- nullable flag
+
+Block layout:
+
+- 4 bytes: block magic `JBLK`
+- 4 bytes: payload length in bytes
+- 4 bytes: row count in the block
+- 4 bytes: CRC-32 of the payload
+- payload: block-local dictionaries followed by row data encoded according to the schema
+
+Row encoding notes:
+
+- nullable columns are tracked with a compact presence bitset per row
+- boolean columns are packed into bitsets
+- integer-like numeric columns are delta-coded per column inside each block
+- string columns use block-local dictionaries, then store compact dictionary indexes in rows
+- because the schema travels with the file, new tables can add, remove, or rename columns without changing the container design
+
+Practical implication:
+
+- compared with CSV, JLOG is much smaller for long matches
+- compared with a single compressed blob, JLOG avoids losing the whole file when the process is interrupted during the final write
+- compared with a fixed binary pose format, JLOG can evolve to hold other analysis tables while still remaining compact
 
 ### WPILOG contents
 
@@ -517,7 +583,7 @@ Appearance distance uses Bhattacharyya distance:
 
 - `cv2.compareHist(..., HISTCMP_BHATTACHARYYA)`
 
-If `--manual-reference-csv` is provided, the tracker samples frames from the labeled CSV and builds up to `REID_MAX_SAMPLES_PER_ROBOT = 48` reference histograms per robot, using every `REID_SAMPLE_STRIDE = 15`th row.
+If `--manual-reference-csv` is provided, the tracker samples frames from the labeled CSV or JLOG and builds up to `REID_MAX_SAMPLES_PER_ROBOT = 48` reference histograms per robot, using every `REID_SAMPLE_STRIDE = 15`th row.
 
 These references make appearance cost meaningful for identity assignment and especially reacquisition.
 
@@ -525,8 +591,8 @@ Important caveat:
 
 - the current loader converts `timestamp_s` directly into `frame_num = timestamp_s * video_fps`
 - it does not add `start_offset`
-- the CSV coordinates are interpreted as center-origin and converted back to the internal `0..144` field plane before projection
-- in practice, manual reference CSVs should be exported against the raw video timeline starting at `0`, or the sampled frames will be shifted early
+- the CSV/JLOG coordinates are interpreted as center-origin and converted back to the internal `0..144` field plane before projection
+- in practice, manual reference CSVs or JLOGs should be exported against the raw video timeline starting at `0`, or the sampled frames will be shifted early
 
 ### 17. Merge detection
 
@@ -655,7 +721,7 @@ How goal openings are found:
 - it extracts the upper part of those contours as the effective opening region
 - if that fails, it falls back to coarse polygons derived from the calibrated field corners
 
-What gets written to CSV:
+What gets written to CSV/JLOG:
 
 - no extra rows are added
 - instead, the current frame's row gets shot metadata for the shooter when a shot resolves
@@ -709,7 +775,7 @@ This file is a standalone browser-based manual annotation tool. It is meant for 
 
 - the automatic tracker struggles
 - you need supervised re-ID references
-- you want a gold-standard CSV for comparison
+- you want a gold-standard pose log for comparison
 
 ### How to use it
 
@@ -719,7 +785,7 @@ This file is a standalone browser-based manual annotation tool. It is meant for 
 4. Select a robot (`R0` to `R3`).
 5. Click the robot location on the video, or edit pose values directly.
 6. Mark frames across the timeline.
-7. Export CSV or session JSON.
+7. Export CSV, JLOG, or session JSON.
 
 No server or build step is required.
 
@@ -735,6 +801,7 @@ No server or build step is required.
 - frame stepping
 - interpolation between labels
 - CSV export in the same schema as `auto_scout.py`
+- JLOG export in the same schema as `auto_scout.py`
 - JSON export of the full editable session
 
 ### Keyboard controls
@@ -749,7 +816,7 @@ No server or build step is required.
 
 ### Export behavior
 
-CSV export settings:
+CSV/JLOG export settings:
 
 - `FPS`: export sample rate
 - `Start`: start time in seconds
@@ -807,7 +874,7 @@ This is useful when validating whether the logger is writing the expected pose a
 
 ## Other Browser Tools
 
-- `tools/data_visualizer.html`: browser-based viewer for exported robot-position CSVs.
+- `tools/data_visualizer.html`: browser-based viewer for exported robot-position CSVs and JLOGs.
 - `tools/shot_visualizer.html`: browser-based viewer focused on shot-event inspection.
 
 ## File Formats
@@ -850,7 +917,7 @@ These values are center-origin:
 - top-left: `(-72, -72)`
 - bottom-right: `(72, 72)`
 
-## Manual reference CSV
+## Manual reference CSV or JLOG
 
 The tracker expects the same schema as `robot_positions.csv`.
 
@@ -867,7 +934,7 @@ Those `robotN_x_in` / `robotN_y_in` values are center-origin coordinates in inch
 
 If shot-event columns are present, the manual re-ID loader simply ignores them.
 
-Because the current implementation treats `timestamp_s` as raw video time, not match-relative time, be careful when reusing CSVs produced with a nonzero `--start-offset` or a nonzero manual tracker export start.
+Because the current implementation treats `timestamp_s` as raw video time, not match-relative time, be careful when reusing CSVs or JLOGs produced with a nonzero `--start-offset` or a nonzero manual tracker export start.
 
 ## Tuning Constants and What They Mean
 
@@ -969,6 +1036,6 @@ At a high level, this project is a perspective-aware multi-object tracker specia
 - four persistent logical tracks with motion prediction
 - appearance-assisted assignment
 - explicit identity-preserving merge logic, including permutation tracking for 3+ robot overlaps
-- export to CSV and WPILOG for downstream analysis
+- export to CSV, JLOG, and WPILOG for downstream analysis
 
 If you understand those pieces, you understand most of how the repository works.

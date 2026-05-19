@@ -402,6 +402,7 @@
         <input id="sessionFile" type="file" accept="application/json,.json">
       </div>
       <button id="exportCsv" class="primary" title="Export robot_positions.csv">CSV</button>
+      <button id="exportJlog" title="Export manual_robot_positions.jlog">JLOG</button>
       <button id="exportJson" title="Export editable tracker session">JSON</button>
       <button id="clearAll" class="danger" title="Clear all labels">Clear</button>
     </header>
@@ -505,6 +506,7 @@
     </main>
   </div>
 
+  <script src="../util/jlog.js"></script>
   <script>
     const ROBOT_COUNT = 4;
     const FIELD_SIZE_IN = 144;
@@ -529,6 +531,7 @@
       cornersFile: document.getElementById("cornersFile"),
       sessionFile: document.getElementById("sessionFile"),
       exportCsv: document.getElementById("exportCsv"),
+      exportJlog: document.getElementById("exportJlog"),
       exportJson: document.getElementById("exportJson"),
       clearAll: document.getElementById("clearAll"),
       video: document.getElementById("video"),
@@ -635,6 +638,7 @@
     els.markCurrent.addEventListener("click", markCurrentPose);
     els.deleteCurrent.addEventListener("click", deleteNearestLabel);
     els.exportCsv.addEventListener("click", exportCsv);
+    els.exportJlog.addEventListener("click", exportJlog);
     els.exportJson.addEventListener("click", exportJson);
 
     els.clearAll.addEventListener("click", () => {
@@ -964,40 +968,59 @@
       });
     }
 
-    function exportCsv() {
+    function buildExportRows() {
       const duration = els.video.duration || maxLabelTime();
       const fps = clamp(Number(els.sampleRate.value) || getNominalFps(), 1, 120);
       const start = clamp(Number(els.startOffset.value) || 0, 0, duration);
       const endRaw = Number(els.endTime.value);
       const end = clamp(Number.isFinite(endRaw) && endRaw > 0 ? endRaw : duration, start, duration || maxLabelTime());
       const dt = 1 / fps;
-      const header = [
-        "timestamp_s",
-        "robot0_x_in", "robot0_y_in", "robot0_heading_rad", "robot0_visible",
-        "robot1_x_in", "robot1_y_in", "robot1_heading_rad", "robot1_visible",
-        "robot2_x_in", "robot2_y_in", "robot2_heading_rad", "robot2_visible",
-        "robot3_x_in", "robot3_y_in", "robot3_heading_rad", "robot3_visible"
-      ];
-      const rows = [header.join(",")];
       const count = Math.max(1, Math.floor((end - start) / dt) + 1);
+      const rows = [];
       for (let i = 0; i < count; i += 1) {
         const t = start + i * dt;
         const matchTime = t - start;
-        const row = [matchTime.toFixed(4)];
+        const row = { timestamp_s: matchTime.toFixed(4) };
         for (let r = 0; r < ROBOT_COUNT; r += 1) {
           const pose = sampleRobotAtTime(r, t, false);
           if (pose && pose.visible) {
-            row.push(pose.xIn.toFixed(2), pose.yIn.toFixed(2), normalizeAngle(pose.heading).toFixed(4), "1");
+            row[`robot${r}_x_in`] = pose.xIn.toFixed(2);
+            row[`robot${r}_y_in`] = pose.yIn.toFixed(2);
+            row[`robot${r}_heading_rad`] = normalizeAngle(pose.heading).toFixed(4);
+            row[`robot${r}_visible`] = "1";
           } else if (pose) {
-            row.push(pose.xIn.toFixed(2), pose.yIn.toFixed(2), normalizeAngle(pose.heading).toFixed(4), "0");
+            row[`robot${r}_x_in`] = pose.xIn.toFixed(2);
+            row[`robot${r}_y_in`] = pose.yIn.toFixed(2);
+            row[`robot${r}_heading_rad`] = normalizeAngle(pose.heading).toFixed(4);
+            row[`robot${r}_visible`] = "0";
           } else {
-            row.push("0.00", "0.00", "0.0000", "0");
+            row[`robot${r}_x_in`] = "0.00";
+            row[`robot${r}_y_in`] = "0.00";
+            row[`robot${r}_heading_rad`] = "0.0000";
+            row[`robot${r}_visible`] = "0";
           }
         }
-        rows.push(row.join(","));
+        rows.push(row);
       }
-      downloadText("manual_robot_positions.csv", rows.join("\n") + "\n", "text/csv");
-      setStatus(`Exported ${rows.length - 1} CSV rows`);
+      return rows;
+    }
+
+    function exportCsv() {
+      const rows = buildExportRows();
+      const lines = [JuiceLog.CSV_COLUMNS.join(",")];
+      rows.forEach((row) => {
+        lines.push(JuiceLog.CSV_COLUMNS.map((key) => row[key] ?? "").join(","));
+      });
+      downloadText("manual_robot_positions.csv", lines.join("\n") + "\n", "text/csv");
+      setStatus(`Exported ${rows.length} CSV rows`);
+    }
+
+    function exportJlog() {
+      const rows = buildExportRows();
+      downloadBlob("manual_robot_positions.jlog", JuiceLog.rowsToBlob(rows, {
+        schema: JuiceLog.ROBOT_POSE_SCHEMA,
+      }));
+      setStatus(`Exported ${rows.length} JLOG rows`);
     }
 
     function exportJson() {
@@ -1357,6 +1380,10 @@
 
     function downloadText(filename, content, type) {
       const blob = new Blob([content], { type });
+      downloadBlob(filename, blob);
+    }
+
+    function downloadBlob(filename, blob) {
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;

@@ -463,8 +463,8 @@
         </div>
       </div>
       <div class="field">
-        <label for="csvFile">AutoScout CSV</label>
-        <input id="csvFile" type="file" accept=".csv,text/csv">
+        <label for="csvFile">AutoScout Data</label>
+        <input id="csvFile" type="file" accept=".csv,.jlog,text/csv,application/octet-stream">
       </div>
       <div class="field">
         <label for="imageUrl">Field image path</label>
@@ -482,13 +482,13 @@
               <canvas id="heatmapLayer" class="overlay" aria-hidden="true"></canvas>
               <svg id="overlay" class="overlay"></svg>
               <div id="empty" class="empty">
-                Load a <code>robot_positions.csv</code> file to explore shot and position layers.
+                Load a <code>robot_positions.csv</code> or <code>robot_positions.jlog</code> file to explore shot and position layers.
               </div>
             </div>
           </div>
         </div>
         <div class="transport">
-          <div class="status" id="status">Load a CSV to begin.</div>
+          <div class="status" id="status">Load a CSV or JLOG to begin.</div>
           <div class="pill green">Made</div>
           <div class="pill red">Missed</div>
           <div class="pill neutral">Position</div>
@@ -606,6 +606,7 @@
 
   <div id="tooltip" class="tooltip"></div>
 
+  <script src="../util/jlog.js"></script>
   <script>
     const ROBOT_COUNT = 4;
     const FIELD_MIN = -72;
@@ -1003,8 +1004,8 @@
 
       if (!hasLoadedData) {
         els.empty.style.display = "grid";
-        els.empty.textContent = "Load a robot_positions.csv file to explore shots and positions.";
-        setStatus("Load a CSV to begin.");
+        els.empty.textContent = "Load a robot_positions.csv or robot_positions.jlog file to explore shots and positions.";
+        setStatus("Load a CSV or JLOG to begin.");
         return;
       }
 
@@ -1418,8 +1419,10 @@
     async function handleCsvFile() {
       const file = els.csvFile.files[0];
       if (!file) return;
-      const text = await file.text();
-      const rows = parseCsv(text);
+      const buffer = await file.arrayBuffer();
+      const rows = JuiceLog.sniffBuffer(buffer)
+        ? JuiceLog.decodeRows(buffer)
+        : parseCsv(new TextDecoder().decode(buffer));
       state.positionsByRobot = extractPositions(rows);
       state.shots = annotateShotsWithMotion(extractShots(rows), state.positionsByRobot);
       render();
@@ -1428,7 +1431,7 @@
     els.csvFile.addEventListener("change", () => {
       handleCsvFile().catch((error) => {
         console.error(error);
-        setStatus(`Failed to parse CSV: ${error.message}`);
+        setStatus(`Failed to parse data file: ${error.message}`);
       });
     });
 
@@ -1509,7 +1512,7 @@
     els.fieldImage.addEventListener("load", () => {
       syncFrameSize();
       if (!state.shots.length && !totalPositionSamples(state.positionsByRobot)) {
-        setStatus("Load a CSV to begin.");
+        setStatus("Load a CSV or JLOG to begin.");
       }
       render();
     });

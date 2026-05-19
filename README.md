@@ -12,11 +12,12 @@
 
 Current outputs are focused on robot motion:
 - `robot_positions.csv` for per-timestamp robot poses and visibility
+- `robot_positions.jlog` for compact binary robot poses and shot events
 - `match_log.wpilog` for AdvantageScope playback
 - optional annotated debug frames in `output/tracker_debug/`
 - optional annotated debug video in `output/tracker_debug.mp4`
 
-The CSV now also includes per-robot shot-event columns:
+The CSV and JLOG pose logs include per-robot shot-event fields:
 
 - `robot#_shot_result`
 - `robot#_shot_x_in`
@@ -58,7 +59,7 @@ python3 auto_scout.py "https://www.youtube.com/watch?v=..."
 ## CLI Flags
 | Flag | Type | Default | Description |
 | -------- | -------- | -------- | -------- |
-| `--output-dir` | `string` | `./output` | Directory for CSV, WPILOG, background image, and debug frames |
+| `--output-dir` | `string` | `./output` | Directory for CSV, JLOG, WPILOG, background image, and debug frames |
 | `--start-offset` | `float` | `0.0` | Seconds to skip before the match timer starts |
 | `--sample-rate` | `float` | `10.0` | Effective frames per second to process |
 | `--debug` | - | disabled | Save annotated debug frames to `tracker_debug/` |
@@ -68,7 +69,7 @@ python3 auto_scout.py "https://www.youtube.com/watch?v=..."
 | `--video-path` | `string` | `None` | Path to the local match video. Requires `--no-download` |
 | `--corners` | `string` | `None` | Path to `field_corners.json` from `tools/calibrate.py` |
 | `--robot-init-positions` | `json` | `None` | Four starting field coordinates in inches, using center-origin coordinates |
-| `--manual-reference-csv` | `string` | `None` | Manual `robot_positions`-style CSV in the same center-origin coordinate system |
+| `--manual-reference-csv` | `string` | `None` | Manual `robot_positions`-style CSV or JLOG in the same center-origin coordinate system |
 
 ## Field Calibration
 AutoScout can try to detect the field outline automatically, but manual calibration is more reliable.
@@ -85,6 +86,8 @@ That produces a `field_corners.json` file. Pass it to `auto_scout.py` with `--co
 
 - `auto_scout.py`
   Main tracker CLI and export pipeline.
+- `util/`
+  Shared helpers including `juice_log.py` and `jlog.js` for the compact `robot_positions.jlog` format.
 - `tools/`
   Helper scripts and browser UIs: `calibrate.py`, `debug.py`, `manual_tracker.html`, `data_visualizer.html`, and `shot_visualizer.html`.
 - `assets/`
@@ -92,7 +95,7 @@ That produces a `field_corners.json` file. Pass it to `auto_scout.py` with `--co
 - `examples/`
   Example local videos for testing and manual workflows.
 - `output/`
-  Default generated outputs such as CSV, WPILOG, background images, and debug media.
+  Default generated outputs such as CSV, JLOG, WPILOG, background images, and debug media.
 - `field_corners.json`
   A local calibration file in the repo root. You can also generate other corner JSON files and pass them with `--corners`.
 - `README.md`, `DOCUMENTATION.md`, `AUTOSCOUT_PAPER.tex`
@@ -103,6 +106,8 @@ When a run finishes, the output directory typically contains:
 
 - `robot_positions.csv`
   Flat table of timestamped robot positions, headings, visibility flags, and shot events. `x/y` are in inches from field center.
+- `robot_positions.jlog`
+  Compact binary JUICE LOG output for the same tracker table data, stored in a self-describing schema format with CRC-checked chunks so truncated writes keep earlier completed data readable.
 - `match_log.wpilog`
   WPILOG output using center-origin coordinates converted to meters with the viewer-facing axis remap `x' = y`, `y' = x`, and `heading' = π/2 - heading`.
 - `median_background.jpg`
